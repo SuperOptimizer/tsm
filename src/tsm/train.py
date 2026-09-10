@@ -1686,6 +1686,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
               f"every={bal.every} (weights {bal.weights})", flush=True)
     model.train()
     t_last = time.perf_counter()
+    nonfinite_grads = 0
     last_parts: dict[str, float] = {}
     print(f"[tsm] training steps {step}..{steps} batch {B} x accum {A} x {P}^3", flush=True)
     while step < steps:
@@ -1728,6 +1729,19 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
                 acc[k] = acc.get(k, 0.0) + v / A
         # aug/<name> = number of samples the transform touched in this optimizer step (B x A samples)
         gn = torch.nn.utils.clip_grad_norm_(clip_params, float(opts["grad_clip"]))
+        # A single bad batch (or a dropped NaN on flaky virtualised CUDA) yields a non-finite
+        # grad norm; taking the step would push inf/NaN into the weights and permanently
+        # collapse the model (seen on the Thunder A6000 at step 5470).  Skip the update instead:
+        # zero the grads, count it, and abort only if it becomes chronic rather than a one-off.
+        if not math.isfinite(float(gn)):
+            nonfinite_grads += 1
+            print(f"[tsm] step {step + 1}: non-finite grad norm ({gn}); skipping optimizer step "
+                  f"({nonfinite_grads} so far)", flush=True)
+            opt.zero_grad(set_to_none=True)
+            if nonfinite_grads > int(opts.get("max_nonfinite_grads", 50)):
+                raise FloatingPointError(f"aborting: {nonfinite_grads} non-finite grad steps")
+            step += 1
+            continue
         opt.step()
         sched.step()
         ema.update(model)
