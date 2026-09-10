@@ -7,7 +7,10 @@ the coarse store by the dataset.  Losses (all masked by the target valid masks):
            + surface-band soft Dice between exp(-|sdf|/2) maps (valid==1)
            ``extra.train.surface_aux`` (all weights 0 by default = unchanged loss) adds
            the zero-set terms ``shell`` / ``crest`` / ``far`` per face (``surface_aux_terms``),
-           logged as ``surface/shell_in`` etc.
+           logged as ``surface/shell_in`` etc., and the two *body* topology terms ``gap``
+           (anti-merge: no predicted body inside a label air gap) and ``cldice`` (soft clDice on
+           the sheet body) which need both faces at once (``surface_body_terms``), logged as
+           ``surface/gap`` / ``surface/cldice``.
            ``extra.train.surface_mode = "faces"`` instead trains a 3-channel head
            [sdf_in, sdf_out, valid] against the two-face labels (``faces_loss``):
            the same L1 + band Dice per face plus the one valid BCE.  Default
@@ -205,6 +208,12 @@ SURFACE_AUX_DEFAULTS: dict[str, Any] = {
     "crest_tol": 1.0,      # |sdf_pred| allowed on a label face voxel before it costs anything
     "far": 0.0,            # weight of the precision term (competes with crest -- keep it small)
     "far_margin": 6.0,     # label distance above which a voxel counts as "far from any face"
+    # body (two-face) topology terms -- see :func:`surface_body_terms`
+    "gap": 0.0,            # weight of the gap-preservation / anti-merge penalty
+    "gap_radius": 3,       # closing radius (voxels): gaps narrower than ~2*radius are protected
+    "gap_tau": 2.0,        # softness (voxels) of the predicted body probability
+    "cldice": 0.0,         # weight of the soft-clDice (topology) term on the sheet body
+    "cldice_iters": 5,     # soft skeletonisation iterations
 }
 BALANCE_MODES = (None, "scale", "gradnorm_lite")
 SDF_SIGMA = 4.0
@@ -423,15 +432,18 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
         raise ValueError(f"unknown extra.train.surface_aux keys: {unknown} "
                          f"(known: {sorted(SURFACE_AUX_DEFAULTS)})")
     out = {**SURFACE_AUX_DEFAULTS, **raw}
-    for k in ("shell", "crest", "far", "shell_margin", "crest_tol", "far_margin"):
+    for k in ("shell", "crest", "far", "shell_margin", "crest_tol", "far_margin", "gap", "gap_tau", "cldice"):
         v = out[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) < 0:
             raise ValueError(f"extra.train.surface_aux.{k} must be a non-negative number, got {v!r}")
         out[k] = float(v)
-    r = out["shell_radius"]
-    if isinstance(r, bool) or not isinstance(r, (int, float)) or int(r) < 1:
-        raise ValueError(f"extra.train.surface_aux.shell_radius must be an integer >= 1, got {r!r}")
-    out["shell_radius"] = int(r)
+    for k in ("shell_radius", "gap_radius", "cldice_iters"):
+        r = out[k]
+        if isinstance(r, bool) or not isinstance(r, (int, float)) or int(r) < 1:
+            raise ValueError(f"extra.train.surface_aux.{k} must be an integer >= 1, got {r!r}")
+        out[k] = int(r)
+    if out["gap"] > 0 and out["gap_tau"] <= 0:
+        raise ValueError("extra.train.surface_aux.gap_tau must be > 0 when gap > 0")
     if surface_aux_active(out) and surface_mode != "faces":
         raise ValueError("extra.train.surface_aux needs extra.train.surface_mode='faces'")
     if out["shell"] > 0 and out["shell_radius"] < out["shell_margin"]:
@@ -445,8 +457,8 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
 
 
 def surface_aux_active(aux: Mapping[str, Any] | None) -> bool:
-    """True when at least one auxiliary surface weight is non-zero."""
-    return bool(aux) and any(float(aux.get(k, 0.0)) > 0.0 for k in ("shell", "crest", "far"))
+    """True when at least one auxiliary surface weight is non-zero (per-face *or* body terms)."""
+    return bool(aux) and any(float(aux.get(k, 0.0)) > 0.0 for k in ("shell", "crest", "far", "gap", "cldice"))
 
 
 def augment_mode(opts: dict[str, Any]) -> tuple[str, Any]:
@@ -569,6 +581,134 @@ def surface_aux_terms(p_sdf: torch.Tensor, t_sdf: torch.Tensor, mv: torch.Tensor
     return out
 
 
+def _erode(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Binary erosion of a 0/1 mask by a cube of ``radius`` voxels (dilation of the complement)."""
+    return 1.0 - _dilate(1.0 - mask, radius)
+
+
+def _close(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Binary morphological *closing* (dilate then erode) with a cube of ``radius`` voxels.
+
+    Closing fills every hole / gap narrower than about ``2 * radius`` voxels and leaves everything
+    else alone, so ``close(x) - x`` is exactly the set of thin gaps inside and between the
+    components of ``x``."""
+    return _erode(_dilate(mask, radius), radius)
+
+
+def body_mask(t_in: torch.Tensor, t_out: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """The label sheet *body* (papyrus material) as a 0/1 map: ``(sdf_in > 0) & (sdf_out < 0)``.
+
+    Same definition as the ``inside`` mask of :func:`evaluate`'s thickness metric: the body is the
+    slab between the two faces, and its thickness is ``sdf_in - sdf_out``.  ``m`` restricts it to
+    the supervised voxels."""
+    return ((t_in > 0) & (t_out < 0)).float() * m
+
+
+def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int) -> torch.Tensor:
+    """``close_radius(body) * (1 - body) * m1`` -- the thin air gaps a weld would fill."""
+    return _close(body_t, radius) * (1.0 - body_t) * m1
+
+
+def soft_body(p_in: torch.Tensor, p_out: torch.Tensor, tau: float) -> torch.Tensor:
+    """Differentiable body probability ``sigmoid(sdf_in / tau) * sigmoid(-sdf_out / tau)``.
+
+    The product of the two half-space indicators the hard body mask ANDs; ``tau`` (voxels, the
+    same scale as :data:`BAND_TAU`) is how sharply the faces cut."""
+    return torch.sigmoid(p_in / tau) * torch.sigmoid(-p_out / tau)
+
+
+def soft_skel(x: torch.Tensor, iters: int) -> torch.Tensor:
+    """Soft skeletonisation of a [0, 1] map (Shit et al. 2021, "clDice"), 3D, differentiable.
+
+    ``soft_erode = -maxpool3d(-x)`` and ``soft_dilate = maxpool3d(x)`` on a 3x3x3 window are the
+    grey-scale morphology min/max; ``soft_open = dilate(erode(x))``.  Each iteration collects the
+    part of the current map that opening removes -- the thin structure -- and then erodes::
+
+        skel = relu(x - open(x)); repeat i times: x = erode(x); skel += relu(x - open(x)) * (1 - skel)
+
+    so after ``iters`` erosions ``skel`` is a thin, one-voxel-ish medial map of ``x``."""
+    def _ero(t: torch.Tensor) -> torch.Tensor:
+        return -F.max_pool3d(-t, kernel_size=3, stride=1, padding=1)
+
+    def _open(t: torch.Tensor) -> torch.Tensor:
+        return F.max_pool3d(_ero(t), kernel_size=3, stride=1, padding=1)
+
+    skel = F.relu(x - _open(x))
+    for _ in range(int(iters)):
+        x = _ero(x)
+        delta = F.relu(x - _open(x))
+        skel = skel + delta * (1.0 - skel)
+    return skel
+
+
+def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor,
+                       mv: torch.Tensor, m1: torch.Tensor, aux: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    """Optional *body* terms of ``extra.train.surface_aux`` (``gap``, ``cldice``), both off by default.
+
+    Unlike ``shell`` / ``crest`` / ``far`` (:func:`surface_aux_terms`, one face at a time) these
+    two look at the region *between* the faces -- the sheet body ``(sdf_in > 0) & (sdf_out < 0)``,
+    whose thickness is ``sdf_in - sdf_out`` -- so they are computed once per crop, not per face.
+    They are adapted from the anti-merge loss of the hercUNet project (separation penalty + soft
+    skeleton recall).  The failure they attack is the student's dominant one (measured 2026-09):
+    **over-connection** -- adjacent wraps welded together across the thin air gap that separates
+    them, plus invented sheets, with essentially zero breaks.  The per-face L1 + band Dice cannot
+    see a weld: filling a 2-voxel gap costs a couple of voxels of SDF error.
+
+    ``gap`` -- gap preservation / anti-merge.  On the *label* side (no gradients) the body mask is
+    morphologically CLOSED with a cube of radius ``gap_radius`` (default 3) and the body itself
+    subtracted::
+
+        narrow_gap = close_r(body_t) * (1 - body_t) * m1
+
+    Closing fills exactly the gaps narrower than ~``2 * gap_radius``, so this is the thin air
+    between two nearby sheets (plus small concavities) -- precisely the voxels a weld would fill.
+    The prediction is scored there with the soft body probability of :func:`soft_body`::
+
+        gap * per_sample_mean(sigmoid(p_in / gap_tau) * sigmoid(-p_out / gap_tau), narrow_gap)
+
+    A perfect prediction has no body in a label gap and scores exactly 0.  The mask is label-side
+    because the gap is a property of the ground truth: deriving it from the prediction would let a
+    model that has already welded the sheets erase its own penalty.  ``per_sample_mean`` (not
+    ``masked_mean``): the narrow gaps are a tiny, very unevenly distributed fraction of a crop, so
+    a crop containing one thin gap must not be drowned by a batch-mate full of open space.
+
+    ``cldice`` -- soft clDice on the body (Shit et al. 2021), the topology term.  With
+    ``p_body`` the soft body and ``t_body`` the label body, both restricted to ``m1``::
+
+        tprec = <soft_skel(p_body), t_body> / <soft_skel(p_body), 1>     (precision: no invented mass)
+        tsens = <soft_skel(t_body), p_body> / <soft_skel(t_body), 1>     (recall: no breaks)
+        cldice_loss = 1 - 2 * tprec * tsens / (tprec + tsens)
+
+    A predicted bridge, weld or extra sheet puts skeleton where the label body is not and drops
+    ``tprec``; a missing or broken sheet leaves label skeleton uncovered and drops ``tsens``.  The
+    sums are over the whole batch (masked); a batch whose label body is empty everywhere returns a
+    constant 0 rather than the degenerate ``1 - 0/0``.
+
+    Returned values are already multiplied by their weight, so the caller just sums them."""
+    out: dict[str, torch.Tensor] = {}
+    w_gap, w_cld = float(aux.get("gap", 0.0)), float(aux.get("cldice", 0.0))
+    if w_gap <= 0 and w_cld <= 0:
+        return out
+    body_t = body_mask(t_in, t_out, mv)          # label side: hard, no gradients
+    if w_gap > 0:
+        tau = float(aux.get("gap_tau", 2.0))
+        gap_m = narrow_gap_mask(body_t, m1, int(aux.get("gap_radius", 3)))
+        out["gap"] = w_gap * per_sample_mean(soft_body(p_in, p_out, tau), gap_m)
+    if w_cld > 0:
+        iters = int(aux.get("cldice_iters", 5))
+        tau = float(aux.get("gap_tau", 2.0))
+        t_b = body_t * m1
+        p_b = soft_body(p_in, p_out, tau) * m1
+        if float(t_b.sum()) <= 0.0:              # nothing to be topologically right about
+            out["cldice"] = torch.zeros((), device=p_in.device, dtype=p_in.dtype)
+        else:
+            sk_p, sk_t = soft_skel(p_b, iters), soft_skel(t_b, iters)
+            tprec = (sk_p * t_b).sum() / (sk_p.sum() + EPS)
+            tsens = (sk_t * p_b).sum() / (sk_t.sum() + EPS)
+            out["cldice"] = w_cld * (1.0 - 2.0 * tprec * tsens / (tprec + tsens + EPS))
+    return out
+
+
 def surface_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
                  weight: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     p_sdf, p_val = pred[:, 0:1].float(), pred[:, 1:2].float()
@@ -595,9 +735,10 @@ def faces_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
     everywhere -- reproduce the previous loss bit for bit.
 
     ``aux`` (``extra.train.surface_aux``) adds the optional zero-set terms of
-    :func:`surface_aux_terms` per face (``shell_in``, ``crest_in``, ``far_in``, ...).  With no
-    ``aux`` -- or all its weights 0 -- nothing is computed and the returned dict is exactly the
-    historical one."""
+    :func:`surface_aux_terms` per face (``shell_in``, ``crest_in``, ``far_in``, ...) and, once for
+    both faces together, the body topology terms of :func:`surface_body_terms` (``gap``,
+    ``cldice``).  With no ``aux`` -- or all its weights 0 -- nothing is computed and the returned
+    dict is exactly the historical one."""
     if pred.shape[1] < 3 or sdf.shape[1] != 2:
         raise ValueError(f"faces mode needs a 3-channel surface head and a 2-channel target, got {tuple(pred.shape)} / {tuple(sdf.shape)}")
     mv = (valid == 1).float()
@@ -612,6 +753,9 @@ def faces_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
         out[f"band_dice_{face}"] = surface_band_dice(p_f, t_f, m1)
         if do_aux:
             out.update(surface_aux_terms(p_f, t_f, mv, m1, aux or {}, face))
+    if do_aux:  # body terms: both faces at once, once per crop
+        out.update(surface_body_terms(pred[:, 0:1].float(), pred[:, 1:2].float(),
+                                      sdf[:, 0:1], sdf[:, 1:2], mv, m1, aux or {}))
     out["valid_bce"] = masked_mean(
         F.binary_cross_entropy_with_logits(pred[:, 2:3].float(), (valid == 1).float(), reduction="none"), m_not2)
     return out

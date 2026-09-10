@@ -1,0 +1,72 @@
+{
+  "volume": {
+    "url": "https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+    "alt_url": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+    "level": 0,
+    "voxel_um": 2.399,
+    "cache_root": "/home/forrest/tsm-cache"
+  },
+  "region": {
+    "start_zyx": [
+      29696,
+      6656,
+      3584
+    ],
+    "size_zyx": [
+      256,
+      4096,
+      4096
+    ]
+  },
+  "budget": {
+    "ram_bytes": 25769803776,
+    "array_bytes": 8589934592,
+    "vram_frac": 0.8,
+    "min_avail_mb": 2048
+  },
+  "out_dir": "/home/ubuntu/tsm-output/s4_long_p192",
+  "extra": {
+    "labels": {
+      "axis_path": "/home/forrest/.cache/tsm-production/axes/PHerc1667/umbilicus-full-resolution.json"
+    },
+    "train": {
+      "steps": 40000,
+      "batch": 1,
+      "accum": 2,
+      "lr": 0.0003,
+      "ckpt_every": 2000,
+      "num_workers": 3,
+      "augment": "strong",
+      "holdout_origins": {
+        "z_frac": 0.15
+      },
+      "eval_holdout": true,
+      "feat_distill": {
+        "enabled": false,
+        "teachers": [
+          "recto",
+          "ink"
+        ],
+        "weight": 0.1,
+        "every": 2
+      },
+      "input_radial": true,
+      "fine_store": "/home/ubuntu/tsm-output/s4/labels/fine.zarr",
+      "coarse_store": "/home/ubuntu/tsm-output/s4/labels/coarse.zarr",
+      "ink_pos_weight": 5.0,
+      "loss_weights": {
+        "surface": 1.0,
+        "ink": 6.0,
+        "winding": 3.0,
+        "fiber": 1.0
+      },
+      "surface_mode": "faces",
+      "heads": {
+        "fiber": true
+      },
+      "winding_source": "merge",
+      "balance": "scale",
+      "patch": 192
+    }
+  }
+}

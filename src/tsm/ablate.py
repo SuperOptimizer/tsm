@@ -43,6 +43,10 @@ REPORT_COLUMNS: list[tuple[str, str, bool]] = [
     ("surface/surf_sym_frac_gt3", "surf >3", True),
     ("surface/out_surf_sym_median", "out med", True),
     ("surface/out_surf_sym_frac_gt3", "out >3", True),
+    # topology: crops where the prediction invented a surface with no label one (over-connection,
+    # the failure the surface_aux gap / cldice terms attack) and where it missed one entirely
+    ("surface/spurious_surfaces", "spurious", True),
+    ("surface/missed_surfaces", "missed", True),
     ("surface/valid_auprc", "valid AUPRC", False),
     ("ink/ink_auprc", "ink AUPRC", False),
     ("winding/phase_err_deg", "phase deg", True),
