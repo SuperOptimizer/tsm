@@ -1,0 +1,46 @@
+[project]
+name = "tsm"
+version = "0.1.0"
+description = "Tiny Scroll Model: one small multi-head 3D model distilled from the Vesuvius Challenge teachers"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "numpy>=2.0",
+    "zarr>=3.0",
+    "numcodecs>=0.15",
+    "edt>=2.4",
+    "scipy>=1.13",
+    "fsspec>=2024.6",
+    "aiohttp>=3.9",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+s3 = ["s3fs>=2024.6"]
+trt = ["tensorrt-cu13", "onnx", "onnxscript", "nvidia-modelopt"]
+viz = ["pillow", "tifffile>=2024.1"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "scikit-image"]
+all = ["tsm[s3,trt,viz,dev]"]
+
+[project.scripts]
+tsm = "tsm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tsm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["slow: needs network or GPU"]
+addopts = "-m 'not slow'"
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu128"
+extra-index-url = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"

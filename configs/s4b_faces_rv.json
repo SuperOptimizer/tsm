@@ -1,0 +1,122 @@
+{
+  "volume": {
+    "url": "https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+    "alt_url": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+    "level": 0,
+    "voxel_um": 2.399,
+    "cache_root": "/home/forrest/tsm-cache"
+  },
+  "region": {
+    "start_zyx": [
+      20480,
+      4736,
+      4928
+    ],
+    "size_zyx": [
+      256,
+      4096,
+      4096
+    ]
+  },
+  "budget": {
+    "ram_bytes": 8589934592,
+    "array_bytes": 2147483648,
+    "vram_frac": 0.8,
+    "min_avail_mb": 2048
+  },
+  "out_dir": "/home/forrest/tsm-output/s4b/slab_faces_rv",
+  "extra": {
+    "teacher": {
+      "models": [
+        "recto",
+        "ink",
+        "lasagna",
+        "m7@l2",
+        "fiber"
+      ],
+      "out_tile": 384,
+      "halo": 128,
+      "tta": {
+        "recto": "flip8",
+        "ink": "none",
+        "lasagna": "flip8_rot4",
+        "m7@l2": "flip8_rot4",
+        "fiber": "none"
+      },
+      "patch": {
+        "lasagna": 256
+      },
+      "skip_existing": true,
+      "backend": "torch",
+      "batch": 1,
+      "dtype": "bf16",
+      "channels_last": false,
+      "cudnn_benchmark": true,
+      "compile": null,
+      "prefetch": true,
+      "empty_window_max": 0
+    },
+    "labels": {
+      "clip": 20,
+      "min_component": 100,
+      "recto_threshold": 0.5,
+      "ignore_band": [
+        0.35,
+        0.65
+      ],
+      "ct_mask_threshold": 30,
+      "teachers_dir": "/home/forrest/tsm-output/s4b/slab_tta/teachers",
+      "faces": {
+        "enabled": true,
+        "body_threshold": 80.0,
+        "close_radius": 6.0,
+        "source": "merge",
+        "rectoverso_store": "/home/forrest/tsm-output/s4b/rectoverso/rectoverso.zarr",
+        "side_reach": 3.0,
+        "min_thickness": 10.0
+      },
+      "halo": 48,
+      "winding_fine": true,
+      "workers": 4,
+      "axis_path": "/home/forrest/.cache/tsm-production/axes/PHerc1667/umbilicus-full-resolution.json"
+    },
+    "train": {
+      "steps": 30000,
+      "batch": 2,
+      "accum": 1,
+      "lr": 0.0003,
+      "ckpt_every": 1000,
+      "num_workers": 2,
+      "augment": "strong",
+      "holdout_origins": {
+        "z_frac": 0.15
+      },
+      "eval_holdout": true,
+      "feat_distill": {
+        "enabled": false,
+        "teachers": [
+          "recto",
+          "ink"
+        ],
+        "weight": 0.1,
+        "every": 2
+      },
+      "input_radial": true,
+      "fine_store": "/home/forrest/tsm-output/s4b/slab_faces_rv/labels/fine.zarr",
+      "coarse_store": "/home/forrest/tsm-output/s4b/slab_faces_rv/labels/coarse.zarr",
+      "ink_pos_weight": 5.0,
+      "loss_weights": {
+        "surface": 1.0,
+        "ink": 6.0,
+        "winding": 3.0,
+        "fiber": 1.0
+      },
+      "surface_mode": "faces",
+      "heads": {
+        "fiber": true
+      },
+      "winding_source": "merge",
+      "axis_path": "/home/forrest/.cache/tsm-production/axes/PHerc1667/umbilicus-full-resolution.json"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "volume": {
+    "url": "https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "alt_url": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+    "level": 0,
+    "voxel_um": 2.4,
+    "cache_root": "/home/forrest/tsm-cache"
+  },
+  "region": {
+    "start_zyx": [
+      45056,
+      12288,
+      16896
+    ],
+    "size_zyx": [
+      256,
+      4096,
+      4096
+    ]
+  },
+  "budget": {
+    "ram_bytes": 8589934592,
+    "array_bytes": 2147483648,
+    "vram_frac": 0.8,
+    "min_avail_mb": 2048
+  },
+  "out_dir": "/home/forrest/tsm-output/paris4b/slab",
+  "extra": {
+    "labels": {
+      "axis_path": "/home/forrest/.cache/tsm-production/axes/PHercParis4/umbilicus-full-resolution.json"
+    }
+  }
+}
