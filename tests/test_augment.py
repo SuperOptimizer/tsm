@@ -583,3 +583,148 @@ def test_spectral_noise_slope_follows_beta():
     x = torch.full((2, 1, 12, 16, 16), 0.5)
     y, _ = a.apply_intensity(x)
     assert 0.5 * 6.0 / 255.0 < float((y - x).std()) < 1.5 * 6.0 / 255.0  # requested grey-level std
+
+
+# --------------------------------------------------------------------------- #
+# transport rules (plan section 5, 2026-09-12): tangent vectors push forward with L,
+# covectors with inv(L)^T; the two agree for every shipped (isotropic) transform
+# --------------------------------------------------------------------------- #
+def _frame_batch(P=8, d0=(0.4, 0.6, -0.5), n0=(0.2, -0.3, 0.9)):
+    """A constant-field batch: geometry inputs, a fibre direction and a winding normal."""
+    def const(v):
+        t = torch.tensor(v, dtype=torch.float32)
+        t = t / t.norm()
+        return t.view(1, 3, 1, 1, 1).expand(1, 3, P, P, P).contiguous()
+
+    r = const((0.0, 1.0, 0.0))
+    a = const((1.0, 0.0, 0.0))
+    n_zyx = const(n0)
+    wnd = torch.cat([torch.zeros(1, 2, P, P, P), torch.full((1, 1, P, P, P), 0.1),
+                     n_zyx.flip(1)], dim=1)  # [sin, cos, density, nx, ny, nz]
+    return {
+        "input": torch.cat([torch.zeros(1, 2, P, P, P), r, a], dim=1),
+        "surface_sdf": torch.zeros(1, 1, P, P, P), "surface_valid": torch.ones(1, 1, P, P, P),
+        "ink_prob": torch.zeros(1, 1, P, P, P), "ink_valid": torch.ones(1, 1, P, P, P),
+        "winding": wnd, "winding_conf": torch.ones(1, 1, P, P, P),
+        "winding_valid": torch.ones(1, 1, P, P, P),
+        "fiber_dir": const(d0), "fiber_str": torch.ones(1, 1, P, P, P),
+        "fiber_weight": torch.ones(1, 1, P, P, P), "fiber_valid": torch.ones(1, 1, P, P, P),
+    }, const(d0)[0, :, 0, 0, 0], n_zyx[0, :, 0, 0, 0]
+
+
+def _unit(v):
+    return v / v.norm()
+
+
+@pytest.mark.parametrize("p", [
+    SpatialParams(flips=(True, False, True)),
+    SpatialParams(rot90=rot90_matrix_inplane(1)),
+    SpatialParams(rotation=rotation_matrix(torch.tensor([0.3, 1.0, -0.2]), math.radians(37.0))),
+    SpatialParams(scale=torch.tensor([1.2, 1.2, 1.2])),
+])
+def test_tangent_and_covector_rules_agree_for_isotropic_transforms(p):
+    """Rotations, flips and an isotropic scale are conformal: ``inv(L)^T`` is ``L`` up to a
+    positive factor, and every vector here is renormalised, so the two rules coincide."""
+    L = p.matrix().float()
+    LinvT = torch.linalg.inv(L).transpose(0, 1)
+    for v in (torch.tensor([0.4, 0.6, -0.5]), torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.1, -0.9, 0.3])):
+        torch.testing.assert_close(_unit(L @ v), _unit(LinvT @ v), atol=1e-5, rtol=0)
+
+
+def test_tangent_and_covector_rules_differ_under_an_anisotropic_scale():
+    p = SpatialParams(scale=torch.tensor([1.6, 0.5, 1.0]))
+    L = p.matrix().float()
+    LinvT = torch.linalg.inv(L).transpose(0, 1)
+    v = torch.tensor([0.4, 0.6, -0.5])
+    assert float((_unit(L @ v) - _unit(LinvT @ v)).abs().max()) > 0.1
+    # and the augmentation uses the right one for each field
+    batch, d0, n0 = _frame_batch()
+    aug = Augment("none", seed=0, input_vec=[(2, 5), (5, 8)])
+    out = aug.apply_spatial(batch, [p])
+    c = (slice(None), slice(None), slice(2, -2), slice(2, -2), slice(2, -2))
+    got_d = out["fiber_dir"][c]
+    cos_l = (got_d * _unit(L @ d0).view(1, 3, 1, 1, 1)).sum(1)
+    cos_c = (got_d * _unit(LinvT @ d0).view(1, 3, 1, 1, 1)).sum(1)
+    assert float(cos_l.abs().min()) > 0.999 and float(cos_c.abs().max()) < 0.99
+    got_n = out["winding"][:, 3:6].flip(1)[c]  # (nx, ny, nz) -> (nz, ny, nx)
+    cos_l = (got_n * _unit(L @ n0).view(1, 3, 1, 1, 1)).sum(1)
+    cos_c = (got_n * _unit(LinvT @ n0).view(1, 3, 1, 1, 1)).sum(1)
+    assert float(cos_c.abs().min()) > 0.999 and float(cos_l.abs().max()) < 0.99
+    # the input frame follows the tangent rule too (and stays orthonormal)
+    r, a = out["input"][:, 2:5], out["input"][:, 5:8]
+    assert float((r * a).sum(1).abs().max()) < 1e-5
+    cos_r = (r[c] * _unit(L @ torch.tensor([0.0, 1.0, 0.0])).view(1, 3, 1, 1, 1)).sum(1)
+    assert float(cos_r.min()) > 0.99
+
+
+# --------------------------------------------------------------------------- #
+# the winding phase is a plain scalar under reflections
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("flips", [(a, b, c) for a in (False, True) for b in (False, True) for c in (False, True)])
+def test_phase_is_a_scalar_under_the_eight_flips_and_keeps_grad_w_dot_r_positive(flips):
+    """``sin``/``cos`` must NOT gain a sign under ``det(L) < 0``: the winding number is a scalar
+    field, and the convention that fixes its sign (``grad w . r > 0``) survives because ``grad w``
+    and the radial transport by the same rule."""
+    P = 12
+    g = torch.arange(P, dtype=torch.float32) - (P - 1) / 2.0
+    phase = (0.1 * g).view(1, 1, 1, P, 1).expand(1, 1, P, P, P).contiguous()  # increases along +y
+    r = torch.zeros(1, 3, P, P, P)
+    r[:, 1] = 1.0  # outward = +y, so grad(w) . r > 0
+    a = torch.zeros(1, 3, P, P, P)
+    a[:, 0] = 1.0
+    n = torch.zeros(1, 3, P, P, P)
+    n[:, 1] = 1.0
+    batch = {
+        "input": torch.cat([torch.zeros(1, 2, P, P, P), r, a], dim=1),
+        "surface_sdf": torch.zeros(1, 1, P, P, P), "surface_valid": torch.ones(1, 1, P, P, P),
+        "ink_prob": torch.zeros(1, 1, P, P, P), "ink_valid": torch.ones(1, 1, P, P, P),
+        "winding": torch.cat([torch.sin(phase), torch.cos(phase), torch.full_like(phase, 0.1),
+                              n.flip(1)], dim=1),
+        "winding_conf": torch.ones(1, 1, P, P, P), "winding_valid": torch.ones(1, 1, P, P, P),
+    }
+    aug = Augment("none", seed=0, input_vec=[(2, 5), (5, 8)])
+    out = aug.apply_spatial(batch, [SpatialParams(flips=flips)])
+    # (a) sin/cos are the flipped scalar fields -- no sign change anywhere
+    axes = [d + 2 for d, f in enumerate(flips) if f]
+    want = torch.flip(batch["winding"][:, 0:2], axes) if axes else batch["winding"][:, 0:2]
+    torch.testing.assert_close(out["winding"][:, 0:2], want, atol=1e-5, rtol=0)
+    # (b) the convention still holds against the transported radial
+    w = torch.atan2(out["winding"][:, 0:1], out["winding"][:, 1:2])
+    grad = torch.stack(torch.gradient(w[:, 0], dim=(-3, -2, -1)), dim=1)
+    dot = (grad * out["input"][:, 2:5]).sum(1)[:, 1:-1, 1:-1, 1:-1]
+    assert float(dot.min()) > 0.0, f"grad(w) . r flipped sign for flips={flips}"
+
+
+# --------------------------------------------------------------------------- #
+# TTA moves the frame the same way
+# --------------------------------------------------------------------------- #
+def test_tta_transports_the_frame_and_keeps_it_orthonormal():
+    from tsm.infer import tta_forward, tta_transforms
+    from tsm.labels import geometry_frame
+    from tsm.student import input_vec_slices
+
+    from tests.synth import synthetic_axis_tilted
+
+    P = 8
+    fr = geometry_frame(synthetic_axis_tilted(0.3, -0.2), (4, 88, 96), (P, P, P))
+    r = torch.from_numpy(fr["radial"])[None]
+    a = torch.from_numpy(fr["axis_dir"])[None]
+    x = torch.cat([torch.zeros(1, 2, P, P, P), r, a], dim=1)
+    vec = input_vec_slices(True, True)
+    for axes, tr in tta_transforms("flip8_rot4"):
+        out = tta_forward(x, axes, tr, vec=vec)
+        ro, ao = out[:, 2:5], out[:, 5:8]
+        assert float((ro * ao).sum(1).abs().max()) < 1e-5
+        assert float((ro.norm(dim=1) - 1).abs().max()) < 1e-5
+        assert float((ao.norm(dim=1) - 1).abs().max()) < 1e-5
+        # the pure flips are exactly the signed-permutation action on both slices
+        if not tr:
+            sign = torch.ones(3)
+            for ax in axes:
+                sign[ax] = -1.0
+            m = np.diag(sign.numpy()).astype(np.int64)
+            for lo, hi, key in ((2, 5, "radial"), (5, 8, "axis_dir")):
+                from tsm import equivariance as eq
+
+                want = torch.from_numpy(np.asarray(eq.apply_vector(fr[key], m))).float()[None]
+                torch.testing.assert_close(out[:, lo:hi], want, atol=1e-5, rtol=0)

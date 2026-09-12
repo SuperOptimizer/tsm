@@ -36,14 +36,17 @@ normalised contributions are logged as ``balance/<head>``; per-head gradient nor
 the head parameters are logged as ``gradnorm/<head>`` every ``grad_log_every`` steps
 in every mode.
 
-Input channels (``extra.train.input_axis``, default false, adds ``(a_z, a_y, a_x)`` -- the
+Input channels (``extra.train.input_axis``, default **true**, adds ``(a_z, a_y, a_x)`` -- the
 scroll-axis direction in volume coordinates, moved as a vector by every spatial transform).
 Input channels (``extra.train.input_radial``, default true): ``[ct z-score, scale const,
 r_z, r_y, r_x]`` -- the last three are the outward unit radial direction from the scroll
-axis (``labels.radial_field``, axis from ``extra.train.axis_path``).  The sdf sign, the
+axis (axis from ``extra.train.axis_path``).  The sdf sign, the
 winding phase sign and the normal orientation are all defined as "away from the axis",
 which a 128^3 crop cannot infer, so the direction is given as input; it is augmented
-exactly like the winding normal target.  ``input_radial`` / ``in_ch`` / ``axis_path`` go
+exactly like the winding normal target.  With ``extra.train.axis_tangent`` (default true)
+the two are the orthonormal (radial, local umbilicus tangent) pair of
+``labels.geometry_frame`` instead of a constant (1, 0, 0) axis and an in-plane radial.
+``input_radial`` / ``input_axis`` / ``axis_tangent`` / ``in_ch`` / ``axis_path`` go
 into the checkpoint config so ``tsm infer`` rebuilds the same input.
 
 Augmentation: ``extra.train.augment`` = True ("strong"), a preset name, a dict (``data.AugmentConfig``),
@@ -140,10 +143,11 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     # optional heads: {"fiber": true} adds the 2-channel fibre-orientation head (needs a fine
     # store built with the fiber_vt / fiber_hz / fiber_valid channels)
     "heads": {"fiber": False},
-    # fibre target encoding (tsm.fiber): "class" (default, the two axis-relative probabilities,
-    # swapped by an augmentation that moves the volume z axis) or "direction" (an axial fibre
-    # direction + strength derived on the fly; a 4-channel head)
-    "fiber_mode": "class",
+    # fibre target encoding (tsm.fiber): "direction" (default: an axial fibre direction +
+    # strength derived on the fly against the local axis tangent; a 4-channel head) or "class"
+    # (legacy ablation: the two axis-relative probabilities, swapped by an augmentation that
+    # moves the volume z axis -- exact only for the cube rotations)
+    "fiber_mode": "direction",
     # class mode only: false reproduces the pre-2026-09-07 bug (classes augmented as invariant
     # scalars).  Kept for the ablation baseline; there is no reason to set it in a real run.
     "fiber_swap_fix": True,
@@ -174,11 +178,15 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     # "merge" (fine where wf_valid == 1, coarse elsewhere).  A store without wf_* is "coarse".
     "winding_source": "coarse",
     "input_radial": True,  # feed the outward radial direction (r_z, r_y, r_x) as input channels 2..4
-    # feed the scroll-axis direction (a_z, a_y, a_x) as three more input channels: constant
-    # (1, 0, 0) before augmentation, rotated with the volume by every spatial transform.  The
-    # fibre classes ("vertical" = along the axis) are unlearnable under all-axes rotations
-    # without it -- the analogue of input_radial for "outward".
-    "input_axis": False,
+    # feed the scroll-axis direction (a_z, a_y, a_x) as three more input channels: the local
+    # umbilicus tangent, rotated with the volume by every spatial transform.  The fibre classes
+    # ("vertical" = along the axis) are unlearnable under all-axes rotations without it -- the
+    # analogue of input_radial for "outward".
+    "input_axis": True,
+    # True (default): the geometry inputs are the orthonormal (radial, local axis tangent) pair
+    # of labels.geometry_frame, and the direction fibre targets are built against that tangent.
+    # False: the pre-2026-09-12 constant (1, 0, 0) axis and purely in-plane radial (ablation).
+    "axis_tangent": True,
     "axis_path": None,  # umbilicus JSON for input_radial; default extra.labels.axis_path / labels.DEFAULT_AXIS
     "augment": True,  # True -> "strong" (v2, GPU) | False -> off | "v1" (CPU flips/rot90 + jitter) | preset name | dict
     # None | [[z,y,x],...] | {"<z|y|x>_frac": f} | {"<z|y|x>_range": [lo, hi]} | {"yx_frac": f} (data.split_holdout)
@@ -235,7 +243,8 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
     lw.update(opts.get("loss_weights") or {})
     opts["loss_weights"] = lw
     opts["input_radial"] = bool(opts.get("input_radial", True))
-    opts["input_axis"] = bool(opts.get("input_axis", False))
+    opts["input_axis"] = bool(opts.get("input_axis", True))
+    opts["axis_tangent"] = bool(opts.get("axis_tangent", True))
     if opts["fiber_mode"] not in FIBER_MODES:
         raise ValueError(f"extra.train.fiber_mode must be one of {list(FIBER_MODES)}, got {opts['fiber_mode']!r}")
     opts["fiber_swap_fix"] = bool(opts["fiber_swap_fix"])
@@ -1261,6 +1270,10 @@ def model_input(batch: dict[str, torch.Tensor], channels_last: bool = False) -> 
     return to_channels_last(x) if channels_last else x
 
 
+#: the tilted constant scroll axis of ``synthetic_batch`` (z, y, x), normalised on use
+SYNTH_AXIS = (1.0, 0.3, -0.2)
+
+
 def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, surface_mode: str = "medial",
                     input_radial: bool = False, fiber: bool = False, fiber_mode: str = "class",
                     fiber_band: bool = False, input_axis: bool = False) -> dict[str, torch.Tensor]:
@@ -1273,9 +1286,12 @@ def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, 
         rad = torch.cat([torch.zeros(batch, 1, P, P, P), r(2) * 2 - 1], 1)
         inp.append(F.normalize(rad, dim=1, eps=1e-6))
     if input_axis:
+        # a *tilted* constant axis (not (1, 0, 0)): a synthetic batch must not accidentally
+        # satisfy "the scroll axis is exactly volume z", which is what the real tangent breaks
         ax = torch.zeros(batch, 3, P, P, P)
-        ax[:, 0] = 1.0
-        inp.append(ax)
+        for i, v in enumerate(SYNTH_AXIS):
+            ax[:, i] = v
+        inp.append(F.normalize(ax, dim=1, eps=1e-6))
     b = {
         "input": torch.cat(inp, 1),
         "voxel_um": torch.full((batch,), 2.4),
@@ -1600,8 +1616,9 @@ def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], aug
         winding_source=str(opts.get("winding_source", "coarse")),
         fiber_mode=str(opts.get("fiber_mode", "class")),
         fiber_band_weight=float(opts.get("fiber_band_weight", 5.0)),
-        input_axis=bool(opts.get("input_axis", False)),
+        input_axis=bool(opts.get("input_axis", True)),
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
+        axis_tangent=bool(opts.get("axis_tangent", True)),
     )
     return ds, train_o, hold_o
 
@@ -1688,8 +1705,9 @@ def build_dataset(cfg: RunCfg, opts: dict[str, Any], augment: bool = True):
         winding_source=str(opts.get("winding_source", "coarse")),
         fiber_mode=str(opts.get("fiber_mode", "class")),
         fiber_band_weight=float(opts.get("fiber_band_weight", 5.0)),
-        input_axis=bool(opts.get("input_axis", False)),
+        input_axis=bool(opts.get("input_axis", True)),
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
+        axis_tangent=bool(opts.get("axis_tangent", True)),
     )
     ds.holdout_origins = hold_o
     print(f"[tsm] {len(ds.origins)} crop origins (patch {ds.patch}, stride {opts['stride']}, coarse factor {ds.factor}), "
@@ -1727,6 +1745,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     heads = heads_for(smode, do_fiber, fmode)
     radial = bool(opts["input_radial"])
     ax_in = bool(opts["input_axis"])
+    ax_tan = bool(opts["axis_tangent"])
     n_in = in_channels(radial, ax_in)
     model = build_model(widths=widths, in_ch=n_in, compile=bool(opts["compile"]), act_ckpt=int(opts["act_ckpt"]),
                         channels_last=cl, surface_mode=smode, body_stride=int(opts["body_stride"]),
@@ -1740,7 +1759,8 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     if radial:
         print(f"[tsm] input_radial: outward radial field from axis {opts['axis_path']}", flush=True)
     if ax_in:
-        print("[tsm] input_axis: the scroll-axis direction (a_z, a_y, a_x) as input channels", flush=True)
+        print(f"[tsm] input_axis: the scroll-axis direction (a_z, a_y, a_x) as input channels "
+              f"({'local umbilicus tangent' if ax_tan else 'constant (1, 0, 0)'})", flush=True)
     if do_fiber:
         print(f"[tsm] fiber_mode={fmode}" + ("" if fmode == "direction" else
               f" (class swap under axis-moving transforms: {bool(opts['fiber_swap_fix'])})"), flush=True)
@@ -1848,7 +1868,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     config_blob = {"train": opts, "widths": list(widths), "surface_mode": smode,
                    "body_stride": int(opts["body_stride"]), "fullres_width": int(opts["fullres_width"]),
                    "norm": str(opts["norm"]),
-                   "input_radial": radial, "input_axis": ax_in, "fiber_mode": fmode,
+                   "input_radial": radial, "input_axis": ax_in, "axis_tangent": ax_tan, "fiber_mode": fmode,
                    "in_ch": n_in, "axis_path": opts["axis_path"], "region": [list(cfg.region.start_zyx), list(cfg.region.size_zyx)], "volume": cfg.volume.__dict__}
 
     aug_mode, aug_spec = augment_mode(opts)
@@ -2198,6 +2218,11 @@ def evaluate(
     for i0 in range(0, n, B):
         items = [ds.to_tensors(ds.load(o[i])) for i in range(i0, min(n, i0 + B))]
         b = to_device(default_collate(items), device)
+        if getattr(ds, "input_axis", False):
+            # the local axis tangent the crops were built with, back out of the input channels:
+            # "vertical" must mean the same thing here as it did in the target derivation
+            lo_a, hi_a = input_vec_slices(bool(getattr(ds, "input_radial", False)), True)[-1]
+            b["axis_dir"] = b["input"][:, lo_a:hi_a]
         with torch.autocast(device, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
             out = model(model_input(b))
         out = {k: (v[0] if isinstance(v, (list, tuple)) else v).float() for k, v in out.items()}
@@ -2241,7 +2266,7 @@ def evaluate(
                 # winding normal where that is not a unit vector) -- the same rule the dataset
                 # used to build the target, so the derived classes are comparable to the teacher
                 nrm, _ = sheet_normal(b["surface_sdf"][:, 0:1], b["winding"][:, 3:6].flip(1))
-                tv, th, ok = fiber_basis(nrm)
+                tv, th, ok = fiber_basis(nrm, b.get("axis_dir"))
                 dp = F.normalize(fb_out[:, 0:3].float(), dim=1, eps=EPS)
                 sp = torch.sigmoid(fb_out[:, 3:4].float())
                 pv, ph = class_from_direction(dp, sp, tv, th)

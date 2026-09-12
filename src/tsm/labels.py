@@ -1124,9 +1124,47 @@ def phase_from_cos(cos: np.ndarray, normal_out: np.ndarray, sigma: float = 1.0, 
     return (-s * mag).astype(np.float32)
 
 
-def radial_field(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[int], scale: int = 1) -> np.ndarray:
+#: half-width (level-0 voxels) of the symmetric difference used for the umbilicus tangent
+AXIS_TANGENT_DZ = 64
+
+
+def axis_tangent_at(axis: np.ndarray, z: np.ndarray | float, dz: float = AXIS_TANGENT_DZ) -> np.ndarray:
+    """Unit tangent (3, ...) of the umbilicus in (z, y, x) at level-0 ``z``.
+
+    Symmetric difference over +-``dz`` level-0 voxels rather than the derivative of the
+    interpolant: the control points are sparse and the knot-local derivative is a step
+    function, which would make the frame discontinuous across a crop boundary."""
+    z = np.asarray(z, dtype=np.float64)
+    y1, x1 = axis_yx_at(axis, z + float(dz))
+    y0, x0 = axis_yx_at(axis, z - float(dz))
+    t = np.stack([np.full(np.shape(z), 2.0 * float(dz)), np.asarray(y1 - y0, dtype=np.float64),
+                  np.asarray(x1 - x0, dtype=np.float64)])
+    n = np.sqrt((t * t).sum(0))
+    return (t / np.where(n == 0.0, 1.0, n)).astype(np.float32)
+
+
+def axis_tangent_field(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[int], scale: int = 1,
+                       dz: float = AXIS_TANGENT_DZ) -> np.ndarray:
+    """Unit umbilicus tangent (3, Z, Y, X) for a box on the grid of ``scale`` (same convention
+    as :func:`radial_field`).  The tangent depends on z only, so it is constant in each slice."""
+    nz, ny, nx = (int(v) for v in shape)
+    z0 = int(origin_zyx[0])
+    k = float(scale)
+    zs = np.arange(z0, z0 + nz, dtype=np.float64) * k + (k - 1.0) / 2.0
+    t = axis_tangent_at(axis, zs, dz)  # (3, Z)
+    return np.ascontiguousarray(np.broadcast_to(t[:, :, None, None], (3, nz, ny, nx)))
+
+
+def radial_field(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[int], scale: int = 1,
+                 tangent: np.ndarray | Sequence[float] | None = None) -> np.ndarray:
     """Outward unit radial field (3, Z, Y, X) for a box whose voxel (0,0,0) sits at
-    ``origin_zyx`` in the grid of ``scale`` (level-0 voxels = scale*i + (scale-1)/2)."""
+    ``origin_zyx`` in the grid of ``scale`` (level-0 voxels = scale*i + (scale-1)/2).
+
+    Without ``tangent`` the radial is the purely in-plane ``(0, y - ay, x - ax)`` -- the
+    historical field, exact only where the scroll axis is exactly volume z.  With a
+    ``tangent`` ``t`` ((3,) or a (3, Z, Y, X) field, :func:`axis_tangent_field`) the same
+    in-plane offset is made perpendicular to the local axis, ``r = normalize(v - (v.t) t)``,
+    so ``r`` and ``t`` are an orthonormal pair at every voxel."""
     dz, dy, dx = (int(v) for v in shape)
     z0, y0, x0 = (int(v) for v in origin_zyx)
     k = float(scale)
@@ -1135,17 +1173,45 @@ def radial_field(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[in
     ys = (np.arange(y0, y0 + dy, dtype=np.float64) * k + off)
     xs = (np.arange(x0, x0 + dx, dtype=np.float64) * k + off)
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    t = None
+    if tangent is not None:
+        t = np.asarray(tangent, dtype=np.float64)
+        if t.ndim == 1:
+            t = t.reshape(3, 1, 1, 1)
+        elif t.ndim != 4 or t.shape[0] != 3:
+            raise ValueError(f"tangent must be (3,) or (3, Z, Y, X), got {t.shape}")
+        t = np.broadcast_to(t, (3, dz, dy, dx))
     for iz in range(dz):
         z = (z0 + iz) * k + off
         ay, ax = axis_yx_at(axis, z)
         ry = yy - ay
         rx = xx - ax
-        nrm = np.sqrt(ry * ry + rx * rx)
+        if t is None:
+            rz = np.zeros_like(ry)
+        else:
+            tz, ty, tx = t[0, iz], t[1, iz], t[2, iz]
+            d = ty * ry + tx * rx  # v . t with v_z = 0
+            rz = -d * tz
+            ry = ry - d * ty
+            rx = rx - d * tx
+        nrm = np.sqrt(rz * rz + ry * ry + rx * rx)
         nrm[nrm == 0] = 1.0
-        out[0, iz] = 0.0
+        out[0, iz] = rz / nrm
         out[1, iz] = ry / nrm
         out[2, iz] = rx / nrm
     return out
+
+
+def geometry_frame(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[int], scale: int = 1,
+                   dz: float = AXIS_TANGENT_DZ) -> dict[str, np.ndarray]:
+    """``{"radial", "axis_dir"}``: the orthonormal pair (outward radial, umbilicus tangent),
+    each (3, Z, Y, X) in (z, y, x), for a box on the grid of ``scale``.
+
+    Only these two: the binormal ``a x r`` is a pseudovector and would leak ``det(L)`` into
+    the net under flip augmentation, and no pseudoscalar exists in the label set."""
+    a = axis_tangent_field(axis, origin_zyx, shape, scale, dz)
+    r = radial_field(axis, origin_zyx, shape, scale, tangent=a)
+    return {"radial": r, "axis_dir": a}
 
 
 def core_mask(axis: np.ndarray, origin_zyx: Sequence[int], shape: Sequence[int], radius: float,

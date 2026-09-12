@@ -35,6 +35,14 @@ def synthetic_axis(z0: int = -100000, z1: int = 100000) -> np.ndarray:
     return np.array([[z0, AXIS_YX[0], AXIS_YX[1]], [z1, AXIS_YX[0], AXIS_YX[1]]], dtype=np.float64)
 
 
+def synthetic_axis_tilted(sy: float = 0.3, sx: float = -0.2, z0: int = -100000, z1: int = 100000) -> np.ndarray:
+    """Umbilicus control points (N, 3) of a *straight but tilted* axis through ``AXIS_YX`` at
+    z = 0: ``(y, x) = AXIS_YX + (sy, sx) * z``, so the exact unit tangent is
+    ``normalize((1, sy, sx))`` everywhere (``labels.axis_tangent_at``)."""
+    return np.array([[z0, AXIS_YX[0] + sy * z0, AXIS_YX[1] + sx * z0],
+                     [z1, AXIS_YX[0] + sy * z1, AXIS_YX[1] + sx * z1]], dtype=np.float64)
+
+
 def fine_fields(shape: tuple[int, int, int], seed: int = 0) -> dict[str, np.ndarray]:
     """Wavy sheets stacked along z; outward = +z. Returns float fields + CT (u8)."""
     Z, Y, X = shape

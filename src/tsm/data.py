@@ -34,9 +34,18 @@ z axis by more than 45 degrees **swap** them (``fiber_swap`` on :class:`Augment`
 derives an axial fibre direction + strength per crop from the same channels and the geometry,
 and transforms it as a vector.  See :mod:`tsm.fiber` for the derivation and the rationale.
 
-Scroll-axis input channels (``input_axis``, ``extra.train.input_axis``): three more input
-channels holding the axis direction in volume coordinates, transformed as a vector exactly like
-the radial ones (``student.input_vec_slices`` gives the slices; ``Augment(input_vec=...)``).
+Scroll-axis input channels (``input_axis``, ``extra.train.input_axis``, default on): three more
+input channels holding the axis direction in volume coordinates, transformed as a vector exactly
+like the radial ones (``student.input_vec_slices`` gives the slices; ``Augment(input_vec=...)``).
+
+Geometry frame (``axis_tangent``, ``extra.train.axis_tangent``, default on): the two vector
+inputs are the **orthonormal** pair ``labels.geometry_frame`` builds from the umbilicus -- the
+local axis tangent (a symmetric difference over +-64 level-0 voxels, so it is continuous across
+crop boundaries) and the radial made perpendicular to it -- instead of a constant ``(1, 0, 0)``
+axis and a purely in-plane radial.  The same tangent is the axis the direction fibre targets are
+built against (``fiber.derive_direction_targets(axis=...)``).  ``axis_tangent=False`` restores
+the old constant fields for the ablation.  Only those two vectors are fed: the binormal ``a x r``
+is a pseudovector and would leak ``det(L)`` under flip augmentation.
 
 Surface mode (``surface_mode``, ``extra.train.surface_mode``): "medial" (default,
 unchanged: ``surface_sdf`` = the single SDF to the recto medial surface, mask
@@ -496,6 +505,18 @@ def _vector_keys(normal_key: str | Sequence[str] | None) -> list[str]:
     return [normal_key] if isinstance(normal_key, str) else list(normal_key)
 
 
+def _orthonormalise_frame(r: torch.Tensor, a: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-orthonormalise the geometry frame ``(radial, axis)`` (each (B, 3, Z, Y, X)) after a
+    resampling: ``a <- a/|a|``, ``r <- (r - (r.a) a)`` normalised.  The axis is kept as it is
+    (it is the coarser, smoother field); zero vectors stay zero."""
+    an = a.norm(dim=1, keepdim=True)
+    a = torch.where(an > eps, a / an.clamp_min(eps), torch.zeros_like(a))
+    r = r - (r * a).sum(dim=1, keepdim=True) * a
+    rn = r.norm(dim=1, keepdim=True)
+    r = torch.where(rn > eps, r / rn.clamp_min(eps), torch.zeros_like(r))
+    return r, a
+
+
 def _flip_fields(fields: dict[str, np.ndarray], axis: int, normal_key: str | Sequence[str] | None) -> None:
     for k in fields:
         fields[k] = np.flip(fields[k], axis=axis + 1)  # arrays are (C, Z, Y, X)
@@ -727,16 +748,22 @@ class CropDataset(Dataset):
         fiber_band_weight: float = FIBER_BAND_WEIGHT,
         input_axis: bool = False,
         core_radius_vox: float = 0.0,
+        axis_tangent: bool = True,
     ) -> None:
         self.surface_mode = str(surface_mode)
         self.input_radial = bool(input_radial)
         self.input_axis = bool(input_axis)
+        # True: the geometry inputs follow the real umbilicus (local tangent + perpendicular
+        # radial, labels.geometry_frame).  False reproduces the pre-2026-09-12 fields -- a
+        # constant (1, 0, 0) axis and the purely in-plane radial -- for the ablation.
+        self.axis_tangent = bool(axis_tangent)
         # umbilicus core mask applied on the fly (extra.train.core_radius_vox), so an existing
         # store can be used without the label rebuild that extra.labels.core_radius_vox needs
         self.core_radius_vox = float(core_radius_vox or 0.0)
         if self.core_radius_vox < 0:
             raise ValueError(f"core_radius_vox must be >= 0, got {core_radius_vox!r}")
-        self.axis = load_axis_spec(axis) if (self.input_radial or self.core_radius_vox > 0) else None
+        self._axis_spec = axis
+        self.axis: np.ndarray | None = None  # loaded below, once fiber/fiber_mode are known
         self.patch = int(patch)
         self.seed = int(seed)
         self.length = int(length)
@@ -772,6 +799,12 @@ class CropDataset(Dataset):
         if self.fiber_mode not in FIBER_MODES:
             raise ValueError(f"fiber_mode must be one of {list(FIBER_MODES)}, got {fiber_mode!r}")
         self.fiber_band_weight = float(fiber_band_weight)
+        # the umbilicus is needed by the geometry input channels, by the core mask and -- for
+        # the local tangent "vertical" is defined against -- by the direction fibre targets,
+        # which are derived even when no axis channel is fed to the net
+        if (self.input_radial or self.input_axis or self.core_radius_vox > 0
+                or (self.fiber and self.fiber_mode == "direction")):
+            self.axis = load_axis_spec(self._axis_spec)
         # the human hz/vt bands are optional: they override the teacher direction where they
         # exist and are carried through for the teacher-independent metric
         self.has_band_channel = BAND_CHANNEL in self.fine.channels
@@ -823,6 +856,20 @@ class CropDataset(Dataset):
         ])
         return {"winding": w, "conf": decode_prob(r("conf"))[None], "valid": r("valid").astype(np.float32)[None]}
 
+    def geometry_frame(self, origin_global_zyx: Sequence[int], shape: Sequence[int]) -> dict[str, np.ndarray]:
+        """``{"radial", "axis_dir"}`` (3, Z, Y, X) for a crop at an absolute level-0 origin.
+
+        ``axis_tangent=True`` (default): the orthonormal pair of :func:`labels.geometry_frame`
+        -- the local umbilicus tangent and the radial made perpendicular to it.  False: the
+        legacy fields, a constant ``(1, 0, 0)`` axis and the purely in-plane radial."""
+        from tsm.labels import geometry_frame, radial_field
+
+        if self.axis_tangent:
+            return geometry_frame(self.axis, origin_global_zyx, shape, scale=1)
+        a = np.zeros((3,) + tuple(int(v) for v in shape), np.float32)
+        a[0] = 1.0
+        return {"radial": radial_field(self.axis, origin_global_zyx, shape, scale=1), "axis_dir": a}
+
     def load(self, origin_local: Sequence[int]) -> dict[str, Any]:
         """Un-augmented sample at a local fine-store origin: ct (1,P,P,P) in [0,1] + targets."""
         store = self.fine
@@ -861,6 +908,12 @@ class CropDataset(Dataset):
         if self.winding_source != "coarse":
             t.update(merge_winding_targets(t, fine_winding_targets(store, z0, y0, x0, P),
                                            self.winding_source))
+        # the geometry frame (outward radial + local umbilicus tangent) of this crop: the
+        # input channels, and the axis the direction fibre targets are built against
+        frame: dict[str, np.ndarray] | None = None
+        if self.axis is not None and (self.input_radial or self.input_axis
+                                      or (self.fiber and self.fiber_mode == "direction")):
+            frame = self.geometry_frame((gz, gy, gx), (P, P, P))
         if self.fiber and self.fiber_mode == "direction":
             # derived on the fly from the two class channels + the geometry, so no label
             # rebuild is needed (tsm.fiber); the sheet normal is grad(sdf_in) where that is a
@@ -875,7 +928,8 @@ class CropDataset(Dataset):
                     fiber_raw["fiber_vt"], fiber_raw["fiber_hz"], t["surface_sdf"][0:1],
                     fiber_raw["fiber_valid"], wn,
                     band=t["fiber_band"] if self.fiber_band else None,
-                    band_weight=self.fiber_band_weight)
+                    band_weight=self.fiber_band_weight,
+                    axis=None if frame is None else frame["axis_dir"])
                 for k, v in d.items():
                     t[k] = v.astype(np.float32)
         if self.core_radius_vox > 0:
@@ -889,13 +943,9 @@ class CropDataset(Dataset):
             t["surface_valid"][0] = np.where(cm, 2.0, t["surface_valid"][0])
             t["winding_valid"][0] = np.where(cm, 0.0, t["winding_valid"][0])
         if self.input_radial:
-            from tsm.labels import radial_field
-
-            t["radial"] = radial_field(self.axis, (gz, gy, gx), (P, P, P), scale=1)
+            t["radial"] = frame["radial"]
         if self.input_axis:
-            # the scroll-axis direction in volume coordinates: constant before augmentation
-            t["axis_dir"] = np.zeros((3, P, P, P), np.float32)
-            t["axis_dir"][0] = 1.0
+            t["axis_dir"] = frame["axis_dir"]
         sample: dict[str, Any] = {
             "ct": (ct.astype(np.float32) / 255.0)[None],
             "voxel_um": float(store.voxel_um),
@@ -1014,6 +1064,7 @@ class MultiStoreDataset(Dataset):
         self.target_keys = d0.target_keys
         self.input_radial = d0.input_radial
         self.input_axis = d0.input_axis
+        self.axis_tangent = d0.axis_tangent
         tr = ([np.asarray(o, np.int32).reshape(-1, 3) for o in train_origins] if train_origins is not None
               else [d.origins for d in self.datasets])
         if len(tr) != len(self.datasets):
@@ -1046,7 +1097,8 @@ class MultiStoreDataset(Dataset):
                                  f"{self.names[0]!r} does{'' if d0.coarse is None else ' not'}")
             if d.coarse is not None and d0.coarse is not None and d.coarse.channels != d0.coarse.channels:
                 raise ValueError(f"store {name!r} has coarse channels {d.coarse.channels} != {d0.coarse.channels}")
-            for attr in ("patch", "surface_mode", "winding_source", "fiber", "fiber_mode", "input_radial", "input_axis"):
+            for attr in ("patch", "surface_mode", "winding_source", "fiber", "fiber_mode", "input_radial", "input_axis",
+                         "axis_tangent"):
                 if getattr(d, attr) != getattr(d0, attr):
                     raise ValueError(f"store {name!r} has {attr}={getattr(d, attr)!r} != {getattr(d0, attr)!r}")
             if d.target_keys != d0.target_keys:
@@ -1608,22 +1660,34 @@ class Augment:
             raise ValueError(f"{len(params)} spatial params for a batch of {B}")
         dev = inp.device
         grid, oob, L = self._grid(params, inp.shape[2:], dev)
-        LinvT = torch.linalg.inv(L).transpose(1, 2)  # (B, 3, 3) zyx: the vector rule (see the normal below)
+        # two transport rules, identical for every *isotropic* transform (rotations, flips,
+        # isotropic scale: inv(L)^T = L there) and different only under ScaleCfg.anisotropic:
+        #   tangent directions (the radial / axis input channels, the fibre direction) push
+        #     forward with L,
+        #   covectors (the winding normal, which is grad of a scalar) with inv(L)^T.
+        LinvT = torch.linalg.inv(L).transpose(1, 2)  # (B, 3, 3) zyx: the covector rule
         out = dict(batch)
         ct = inp[:, 0:1].float()
         ct_t = F.grid_sample(ct, grid, mode="bilinear", padding_mode=self.cfg.oob_fill, align_corners=False)
         parts = [ct_t, inp[:, 1:2]]
-        # (z, y, x) vector input channels (radial, scroll axis): resample, then transform as a
-        # vector and renormalise -- exactly the winding-normal rule
+        # (z, y, x) vector input channels (radial, scroll axis): resample, then push forward
+        # with L and renormalise
         vecs = self.input_vec if self.input_vec is not None else ([(2, 5)] if inp.shape[1] >= 5 else [])
-        cut = 2
+        moved: list[torch.Tensor] = []
         for lo_c, hi_c in vecs:
+            r = F.grid_sample(inp[:, lo_c:hi_c].float(), grid, mode="bilinear", padding_mode="border", align_corners=False)
+            r = torch.einsum("bij,bjdhw->bidhw", L, r)
+            rn = r.norm(dim=1, keepdim=True)
+            moved.append(torch.where(rn > 1e-6, r / rn.clamp_min(1e-6), torch.zeros_like(r)))
+        if len(moved) == 2:
+            # radial first, axis second (student.input_vec_slices): trilinear resampling and an
+            # elastic warp both break r . a == 0, so the frame is re-orthonormalised here
+            moved[0], moved[1] = _orthonormalise_frame(moved[0], moved[1])
+        cut = 2
+        for (lo_c, hi_c), v in zip(vecs, moved):
             if lo_c > cut:
                 parts.append(inp[:, cut:lo_c])
-            r = F.grid_sample(inp[:, lo_c:hi_c].float(), grid, mode="bilinear", padding_mode="border", align_corners=False)
-            r = torch.einsum("bij,bjdhw->bidhw", LinvT, r)
-            rn = r.norm(dim=1, keepdim=True)
-            parts.append(torch.where(rn > 1e-6, r / rn.clamp_min(1e-6), torch.zeros_like(r)))
+            parts.append(v)
             cut = hi_c
         out["input"] = torch.cat(parts + [inp[:, cut:]], dim=1)
         if "surface_valid" not in batch:
@@ -1681,6 +1745,11 @@ class Augment:
             # labels saturated at +-clip that were shrunk below the clip are unknown -> ignore (2)
             sat = (sdf.abs() >= self.clip * s_iso * (1.0 - 1e-3)) & (sv_t == 1) & shrunk.view(B, 1, 1, 1, 1)
             sv_t = torch.where(sat.any(dim=1, keepdim=True), torch.full_like(sv_t, 2.0), sv_t)
+        # (sin, cos) of the winding phase are plain SCALARS under every transform, reflections
+        # included: the winding number is a scalar field, and the convention that fixes its sign
+        # -- grad(w) . r > 0, "the phase increases outward" -- survives because grad(w) and the
+        # radial transport by the same rule, so their inner product is invariant.  A sign flip
+        # under det(L) < 0 would be a bug, not a fix.
         sc = F.normalize(wnd[:, 0:2], dim=1, eps=1e-6)
         n_in = wnd[:, 3:6]  # (nx, ny, nz)
         n_zyx = n_in.flip(1)  # (nz, ny, nx)
@@ -1705,7 +1774,7 @@ class Augment:
                 a0 += 2
             if fb_dir:
                 d = div(s[:, a0:a0 + 3], den_f.expand(-1, 3, -1, -1, -1))
-                d = torch.einsum("bij,bjdhw->bidhw", LinvT, d)  # the axial direction is a vector
+                d = torch.einsum("bij,bjdhw->bidhw", L, d)  # a tangent direction: push forward with L
                 dn = d.norm(dim=1, keepdim=True)
                 out["fiber_dir"] = torch.where(dn > 1e-6, d / dn.clamp_min(1e-6), torch.zeros_like(d))
                 out["fiber_str"] = div(s[:, a0 + 3:a0 + 4], den_f)

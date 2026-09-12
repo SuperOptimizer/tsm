@@ -100,23 +100,45 @@ def sdf_normal(sdf: torch.Tensor, lo: float = GRAD_LO, hi: float = GRAD_HI) -> t
 
 
 def sheet_normal(sdf: torch.Tensor, fallback: torch.Tensor | None = None,
-                 lo: float = GRAD_LO, hi: float = GRAD_HI) -> tuple[torch.Tensor, torch.Tensor]:
+                 lo: float = GRAD_LO, hi: float = GRAD_HI,
+                 prefer_fallback: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Sheet normal from ``grad sdf``, falling back to ``fallback`` (the winding normal, (z, y, x))
-    where the gradient is undefined.  Returns ``(n, ok)``; ``n`` is 0 where ``ok`` is False."""
+    where the gradient is undefined.  Returns ``(n, ok)``; ``n`` is 0 where ``ok`` is False.
+
+    ``prefer_fallback`` reverses the priority: the fallback is used wherever it is a unit
+    vector and ``grad sdf`` only fills the gaps.  That is what the body surface mode wants --
+    the gradient of a body SDF is degenerate on the medial ridge -- and it changes nothing
+    for the two-face / medial targets, where it stays off."""
     n, ok = sdf_normal(sdf, lo, hi)
     if fallback is not None:
         fb, fmag = normalize_vec(fallback.float(), dim=-4)
-        use = (~ok) & (fmag > 0.5)
+        good = fmag > 0.5
+        use = good if prefer_fallback else ((~ok) & good)
         n = torch.where(use, fb, n)
         ok = ok | use
     return n * ok, ok
 
 
-def _axis_like(n: torch.Tensor, axis: Sequence[float] | torch.Tensor | None) -> torch.Tensor:
-    """The scroll axis as a (3, 1, 1, 1) field: vectors always carry their components at
-    dim -4, so this broadcasts against both (3, Z, Y, X) and (B, 3, Z, Y, X)."""
-    a = torch.as_tensor(AXIS_ZYX if axis is None else axis, dtype=n.dtype, device=n.device)
-    return a.reshape(3, 1, 1, 1)
+def _axis_like(n: torch.Tensor, axis: Sequence[float] | np.ndarray | torch.Tensor | None) -> torch.Tensor:
+    """The scroll axis broadcast against ``n``: vectors always carry their components at dim -4,
+    so a constant ``(3,)`` axis becomes ``(3, 1, 1, 1)`` and broadcasts against both
+    ``(3, Z, Y, X)`` and ``(B, 3, Z, Y, X)``.
+
+    ``axis`` may also be a **per-voxel tangent field** ``(3, Z, Y, X)`` / ``(B, 3, Z, Y, X)``
+    (``labels.axis_tangent_field``): the umbilicus is not exactly volume z, so "vertical" is
+    the local tangent, not a global constant."""
+    if isinstance(axis, torch.Tensor):
+        a = axis.to(dtype=n.dtype, device=n.device)
+    else:
+        a = torch.as_tensor(np.asarray(AXIS_ZYX if axis is None else axis, dtype=np.float32),
+                            dtype=n.dtype, device=n.device)
+    if a.ndim == 1:
+        if a.shape[0] != 3:
+            raise ValueError(f"axis must have 3 components, got {tuple(a.shape)}")
+        return a.reshape(3, 1, 1, 1)
+    if a.ndim in (4, 5) and a.shape[-4] == 3:
+        return a
+    raise ValueError(f"axis must be (3,), (3, Z, Y, X) or (B, 3, Z, Y, X), got {tuple(a.shape)}")
 
 
 def _cross(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

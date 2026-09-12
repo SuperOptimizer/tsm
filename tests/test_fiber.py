@@ -20,7 +20,7 @@ from tsm.teachers import TEACHERS, build_teacher, infer_vesuvius_arch
 from tsm.train import TRAIN_DEFAULTS, compute_losses, fiber_loss, synthetic_batch, train_opts
 from tsm.volume import VolumeReader
 
-from tests.synth import make_synthetic
+from tests.synth import make_synthetic, synthetic_axis, synthetic_axis_tilted
 
 INVENTORY = os.path.join(os.path.dirname(__file__), "data", "fiber_tensor_inventory.json")
 
@@ -574,7 +574,8 @@ def test_direction_mode_survives_the_whole_train_path(tmp_path):
     s = make_synthetic(str(tmp_path), fine_shape=(32, 64, 64), fine_origin=(0, 0, 0), chunk=32,
                        faces=True, fiber=True, rv=True)
     ds = CropDataset(lambda: VolumeReader(s["ct"], 0, 2.4), s["fine"], None, patch=16, stride=16, length=4,
-                     augment=False, fiber=True, surface_mode="faces", fiber_mode="direction", input_axis=True)
+                     augment=False, fiber=True, surface_mode="faces", fiber_mode="direction",
+                     input_axis=True, axis=synthetic_axis())
     assert ds.fiber_band and ds.target_keys["fiber_dir"] == 3
     item = ds[0]
     assert item["input"].shape[0] == in_channels(False, True) == 5
@@ -638,10 +639,11 @@ def test_direction_prediction_channels_and_derived_classes(tmp_path):
     assert vt.min() > 250 and hz.max() < 5  # a pure vertical direction decodes back to vt = 1
 
 
-def test_class_mode_is_the_default_and_old_checkpoints_still_load():
-    assert TRAIN_DEFAULTS["fiber_mode"] == "class" and TRAIN_DEFAULTS["fiber_swap_fix"] is True
-    assert TRAIN_DEFAULTS["input_axis"] is False
-    assert heads_for("faces", True)["fiber"] == 2
+def test_direction_mode_is_the_default_and_old_checkpoints_still_load():
+    # 2026-09-12: the defaults flipped to the direction head + the real axis input (plan section 2).
+    assert TRAIN_DEFAULTS["fiber_mode"] == "direction" and TRAIN_DEFAULTS["fiber_swap_fix"] is True
+    assert TRAIN_DEFAULTS["input_axis"] is True and TRAIN_DEFAULTS["axis_tangent"] is True
+    assert heads_for("faces", True)["fiber"] == 2  # heads_for still defaults to the class head
     # a checkpoint config from before fiber_mode / input_axis existed
     kw = student_build_kw({"surface_mode": "faces", "heads": {"fiber": True}, "widths": [8, 16, 32]})
     assert kw["fiber_mode"] == "class" and kw["in_ch"] == 2
@@ -666,3 +668,170 @@ def test_new_fiber_configs():
     assert set(op["variants"]) == {"class_fixed", "direction"}
     assert op["variants"]["class_fixed"]["fiber_swap_fix"] is True
     assert op["out_dir"].endswith("slab_faces_rvfw/ablation_fiber")
+
+
+# --------------------------------------------------------------------------- #
+# per-voxel axis field: "vertical" is the LOCAL umbilicus tangent (2026-09-12)
+# --------------------------------------------------------------------------- #
+def test_fiber_basis_accepts_a_per_voxel_axis_field():
+    from tsm.labels import axis_tangent_field
+
+    P = 6
+    n0 = np.array([0.0, 1.0, 0.0], np.float32)
+    n = torch.from_numpy(n0).view(3, 1, 1, 1).expand(3, P, P, P).contiguous()
+    a_np = axis_tangent_field(synthetic_axis_tilted(0.3, -0.2), (0, 0, 0), (P, P, P))
+    a = torch.from_numpy(a_np)
+    assert a.shape == (3, P, P, P)
+    tv, th, ok = fiber_basis(n, a)
+    assert bool(ok.all())
+    for u, v in ((tv, th), (tv, n), (th, n)):
+        assert float((u * v).sum(0).abs().max()) < 1e-5
+    torch.testing.assert_close(tv.norm(dim=0), torch.ones(P, P, P), atol=1e-5, rtol=0)
+    # t_v is the axis projected into the sheet, so it lies in span(a, n) and is NOT the
+    # constant-axis answer any more
+    tv_c, th_c, _ = fiber_basis(n)
+    assert float((tv * tv_c).sum(0).abs().min()) < 0.999
+    proj = a - (a * n).sum(0, keepdim=True) * n          # the axis projected into the sheet
+    proj = proj / proj.norm(dim=0, keepdim=True)
+    torch.testing.assert_close(tv, proj, atol=1e-5, rtol=0)
+    # a batched field broadcasts against a batched normal
+    tvb, _, okb = fiber_basis(n[None].expand(2, 3, P, P, P), a[None].expand(2, 3, P, P, P))
+    assert tvb.shape == (2, 3, P, P, P) and bool(okb.all())
+    torch.testing.assert_close(tvb[0], tv, atol=1e-6, rtol=0)
+    # a constant (3,) axis still works, and a bad shape is rejected
+    torch.testing.assert_close(fiber_basis(n, (1.0, 0.0, 0.0))[0], tv_c, atol=1e-6, rtol=0)
+    with pytest.raises(ValueError):
+        fiber_basis(n, torch.zeros(4, P, P))
+
+
+def test_direction_targets_use_the_axis_they_are_given():
+    """The bug this fixes: the targets were always built against (1, 0, 0), so a tilted scroll
+    axis made "vertical" mean the wrong thing everywhere."""
+    c = _plane_crop((0, 1, 0), 1.0, 0.0)
+    ax = np.asarray([1.0, 0.3, -0.2], np.float32)
+    ax = ax / np.linalg.norm(ax)
+    fld = np.broadcast_to(ax[:, None, None, None], (3,) + c["sdf"].shape[1:]).copy()
+    t_const = derive_direction_targets(c["p_vt"], c["p_hz"], c["sdf"], c["valid"])
+    t_field = derive_direction_targets(c["p_vt"], c["p_hz"], c["sdf"], c["valid"], axis=fld)
+    d_const, d_field = torch.from_numpy(t_const["fiber_dir"]), torch.from_numpy(t_field["fiber_dir"])
+    cos = (d_const * d_field).sum(0).abs()
+    assert float(cos.max()) < 0.999            # a different "vertical"
+    n, _ = sheet_normal(torch.from_numpy(c["sdf"]))
+    tv, _, ok = fiber_basis(n, torch.from_numpy(fld))
+    torch.testing.assert_close(d_field.abs(), tv.abs(), atol=1e-5, rtol=0)
+    assert bool(ok.all())
+
+
+def test_direction_targets_are_equivariant_under_the_cube_rotations_with_a_real_axis():
+    """Rotate the crop *and its axis field*: the derived direction must rotate with them
+    (exactly for the 24 cube rotations, to <1 degree for a random SO(3) rotation)."""
+    from tsm import equivariance as eq
+
+    P = 16
+    c = _plane_crop((0.2, 0.9, -0.3), 0.9, 0.2, size=P)
+    ax = np.asarray([1.0, 0.3, -0.2], np.float32)
+    ax /= np.linalg.norm(ax)
+    fld = np.broadcast_to(ax[:, None, None, None], (3, P, P, P)).copy()
+    t0 = derive_direction_targets(c["p_vt"], c["p_hz"], c["sdf"], c["valid"], axis=fld)
+    d0 = t0["fiber_dir"]
+    core = (slice(2, -2),) * 3
+    for m in cube_rotations():
+        g = np.round(m.numpy()).astype(np.int64)
+        t1 = derive_direction_targets(
+            np.asarray(eq.apply(c["p_vt"], g)), np.asarray(eq.apply(c["p_hz"], g)),
+            np.asarray(eq.apply(c["sdf"], g)), np.asarray(eq.apply(c["valid"], g)),
+            axis=np.asarray(eq.apply_vector(fld, g)))
+        want = np.asarray(eq.apply_vector(d0, g))
+        cos = np.abs((t1["fiber_dir"] * want).sum(0))[core]
+        assert cos.min() > 1 - 1e-4, m
+    # a random SO(3) rotation: the same, within interpolation error
+    R = eq.random_rotation_matrix(3)
+    t1 = derive_direction_targets(
+        np.asarray(eq.apply_rotation(c["p_vt"], R)), np.asarray(eq.apply_rotation(c["p_hz"], R)),
+        np.asarray(eq.apply_rotation(c["sdf"], R)), np.ones_like(c["valid"]),
+        axis=np.asarray(eq.apply_vector(fld, R)))
+    want = np.asarray(eq.apply_vector(d0, R))
+    want /= np.maximum(np.linalg.norm(want, axis=0, keepdims=True), 1e-6)
+    inner = (slice(4, -4),) * 3
+    cos = np.abs((t1["fiber_dir"] * want).sum(0))[inner]
+    assert cos.min() > 0.99
+
+
+def test_sheet_normal_can_prefer_the_fallback():
+    """``prefer_fallback`` (for the body surface mode, whose SDF gradient is degenerate on the
+    medial ridge); the default is unchanged."""
+    c = _plane_crop((0, 1, 0), 1.0, 0.0)
+    sdf = torch.from_numpy(c["sdf"])
+    fb = torch.zeros_like(sdf.expand(3, *sdf.shape[1:]).contiguous())
+    fb[2] = 1.0  # a unit fallback normal along +x, everywhere
+    n_def, ok_def = sheet_normal(sdf, fb)
+    torch.testing.assert_close(n_def[1].abs(), torch.ones_like(n_def[1]), atol=1e-5, rtol=0)
+    n_pref, ok_pref = sheet_normal(sdf, fb, prefer_fallback=True)
+    torch.testing.assert_close(n_pref, fb, atol=1e-6, rtol=0)
+    assert bool(ok_def.all()) and bool(ok_pref.all())
+    # without a fallback the flag changes nothing
+    torch.testing.assert_close(sheet_normal(sdf, None, prefer_fallback=True)[0], sheet_normal(sdf)[0])
+
+
+def test_class_mode_still_trains_end_to_end(tmp_path):
+    """Legacy ablation path: the class head must keep working now that direction is the default."""
+    from torch.utils.data import DataLoader
+
+    from tsm.train import model_input
+
+    s = make_synthetic(str(tmp_path), fine_shape=(32, 64, 64), fine_origin=(0, 0, 0), chunk=32,
+                       faces=True, fiber=True)
+    ds = CropDataset(lambda: VolumeReader(s["ct"], 0, 2.4), s["fine"], None, patch=16, stride=16,
+                     length=4, augment=False, fiber=True, surface_mode="faces", fiber_mode="class")
+    assert ds.axis is None  # the class mode needs no umbilicus at all
+    batch = next(iter(DataLoader(ds, batch_size=2, num_workers=0, drop_last=True)))
+    batch, _ = Augment("strong", seed=0)(batch)
+    net = build_model(widths=(8, 16, 32), in_ch=int(batch["input"].shape[1]), surface_mode="faces",
+                      fiber=True, fiber_mode="class").train()
+    loss, parts = compute_losses(net(model_input(batch)), batch, TRAIN_DEFAULTS["loss_weights"],
+                                 surface_mode="faces")
+    loss.backward()
+    assert parts["fiber"] > 0.0 and {"fiber/vt_bce", "fiber/hz_bce"} <= set(parts)
+
+
+def test_write_fiber_class_channels_can_use_the_real_axis_tangent(tmp_path):
+    """The inference-side derivation takes the same axis the targets were built against."""
+    import zarr as _zarr
+
+    from tsm.data import encode_prob, encode_sdf, encode_signed
+    from tsm.infer import pred_channels
+    from tsm.volume import BrickWriter
+
+    P = 16
+    ch = pred_channels("faces", True, "direction")
+    path = str(tmp_path / "pred.zarr")
+    org = (0, 40, 40)
+    w = BrickWriter(path, ch, (P, P, P), chunk=P, origin_zyx=org, voxel_um=2.4, scale=1.0)
+    ax = synthetic_axis_tilted(0.3, -0.2)
+    from tsm.labels import axis_tangent_field
+
+    a = axis_tangent_field(ax, (0, 40, 40), (P, P, P))
+    n0 = np.zeros((3, P, P, P), np.float32)
+    n0[1] = 1.0  # sheet normal along +y
+    tv, _, ok = fiber_basis(torch.from_numpy(n0), torch.from_numpy(a))
+    assert bool(ok.all())
+    g = np.stack(np.meshgrid(*[np.arange(P, dtype=np.float32) - (P - 1) / 2.0] * 3, indexing="ij"))
+    data = {c: np.zeros((P, P, P), np.uint8) for c in ch}
+    data["sdf_in"] = encode_sdf((g * n0[:, :1, :1, :1].reshape(3, 1, 1, 1)).sum(0), 20.0)
+    for i, c in enumerate(("fiber_dz", "fiber_dy", "fiber_dx")):
+        data[c] = encode_signed(tv[i].numpy())          # a purely "vertical" prediction
+    data["fiber_strength"] = encode_prob(np.ones((P, P, P), np.float32))
+    for ci, name in enumerate(ch):
+        w.write(ci, *org, np.ascontiguousarray(data[name]))
+    info = write_fiber_class_channels(path, 20.0, brick=P, axis=ax)
+    assert info["axis_tangent"] is True and info["basis_defined_frac"] > 0.9
+    arr = _zarr.open_array(store=path, mode="r")
+    core = (slice(2, -2),) * 3
+    vt = np.asarray(arr[ch.index("fiber_vt")])[core]
+    hz = np.asarray(arr[ch.index("fiber_hz")])[core]
+    assert vt.min() > 250 and hz.max() < 5
+    # the same store read against the constant (1, 0, 0) axis decodes a mixture instead
+    info2 = write_fiber_class_channels(path, 20.0, brick=P)
+    assert info2["axis_tangent"] is False
+    arr2 = _zarr.open_array(store=path, mode="r")
+    assert np.asarray(arr2[ch.index("fiber_hz")])[core].max() > 20

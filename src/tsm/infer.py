@@ -70,6 +70,7 @@ __all__ = [
     "tta_inverse",
     "load_student",
     "student_build_kw",
+    "checkpoint_axis_tangent",
     "student_rf_radius",
     "rf_tiling",
     "extract_surface",
@@ -414,7 +415,8 @@ class StudentNet(nn.Module):
 
     def __init__(self, net: nn.Module, voxel_um: float, clip: float, tta: str | bool = "none",
                  surface_mode: str = "medial", input_radial: bool = False, axis: Any = None,
-                 input_axis: bool = False, fiber_mode: str = "class") -> None:
+                 input_axis: bool = False, fiber_mode: str = "class",
+                 axis_tangent: bool = True) -> None:
         super().__init__()
         self.net = net
         self.scale = float(scale_channel_value(voxel_um))
@@ -423,18 +425,23 @@ class StudentNet(nn.Module):
         self.surface_mode = str(surface_mode)
         self.input_radial = bool(input_radial)
         self.input_axis = bool(input_axis)
+        # True: the geometry channels follow the real umbilicus (local tangent + perpendicular
+        # radial, labels.geometry_frame).  False: the legacy constant (1, 0, 0) axis and the
+        # in-plane radial -- what every checkpoint written before 2026-09-12 was trained with.
+        self.axis_tangent = bool(axis_tangent)
         self.fiber_mode = str(fiber_mode)
         # sliding.predict_box hands the absolute origin of every window to a net that asks for it
-        self.needs_box_origin = self.input_radial
+        self.needs_box_origin = self.input_radial or self.input_axis
         self.axis = None
-        if self.input_radial:
+        if self.needs_box_origin:
             from tsm.data import load_axis_spec
 
             self.axis = load_axis_spec(axis)
 
-    def radial(self, x: torch.Tensor, box_origin_zyx: Sequence[Sequence[int]] | Sequence[int]) -> torch.Tensor:
-        """(B, 3, p, p, p) outward radial field for the windows starting at ``box_origin_zyx``."""
-        from tsm.labels import radial_field
+    def frame(self, x: torch.Tensor, box_origin_zyx: Sequence[Sequence[int]] | Sequence[int]) -> dict[str, torch.Tensor]:
+        """``{"radial", "axis_dir"}`` (B, 3, p, p, p) for the windows starting at ``box_origin_zyx``
+        -- the same fields ``CropDataset`` feeds at training time (``labels.geometry_frame``)."""
+        from tsm.labels import geometry_frame, radial_field
 
         B = int(x.shape[0])
         shape = tuple(int(v) for v in x.shape[2:])
@@ -443,27 +450,36 @@ class StudentNet(nn.Module):
             origins = [origins] * B  # one origin for the whole batch
         if len(origins) != B:
             raise ValueError(f"{len(origins)} window origins for a batch of {B}")
-        r = np.stack([radial_field(self.axis, o, shape, scale=1) for o in origins])
-        return torch.from_numpy(r).to(x.device, x.dtype)
+        if self.axis_tangent:
+            fr = [geometry_frame(self.axis, o, shape, scale=1) for o in origins]
+        else:
+            a = np.zeros((3,) + shape, np.float32)
+            a[0] = 1.0
+            fr = [{"radial": radial_field(self.axis, o, shape, scale=1), "axis_dir": a} for o in origins]
+        return {k: torch.from_numpy(np.stack([f[k] for f in fr])).to(x.device, x.dtype)
+                for k in ("radial", "axis_dir")}
+
+    def radial(self, x: torch.Tensor, box_origin_zyx: Sequence[Sequence[int]] | Sequence[int]) -> torch.Tensor:
+        """(B, 3, p, p, p) outward radial field for the windows starting at ``box_origin_zyx``."""
+        return self.frame(x, box_origin_zyx)["radial"]
 
     def raw(self, x: torch.Tensor, box_origin_zyx: Any = None) -> dict[str, torch.Tensor]:
         """TTA-averaged raw head dict (pre-activation)."""
         s = torch.full_like(x, self.scale)
         parts = [x, s]
         vecs: list[tuple[int, int]] = []
-        if self.input_radial:
+        if self.input_radial or self.input_axis:
             if box_origin_zyx is None:
-                raise ValueError("input_radial student needs box_origin_zyx (the window's absolute (z, y, x) origin)")
-            parts.append(self.radial(x, box_origin_zyx))
-            vecs.append((2, 5))
-        if self.input_axis:
-            # the scroll-axis direction: constant (1, 0, 0) in (z, y, x), moved by the TTA
-            # transform exactly like the radial field
-            a = torch.zeros((x.shape[0], 3) + tuple(x.shape[2:]), device=x.device, dtype=x.dtype)
-            a[:, 0] = 1.0
-            start = 2 + 3 * len(vecs)
-            parts.append(a)
-            vecs.append((start, start + 3))
+                raise ValueError("a student with geometry inputs needs box_origin_zyx "
+                                 "(the window's absolute (z, y, x) origin)")
+            fr = self.frame(x, box_origin_zyx)
+            # both are (z, y, x) vector fields and are moved by the TTA transform as such
+            for on, k in ((self.input_radial, "radial"), (self.input_axis, "axis_dir")):
+                if not on:
+                    continue
+                start = 2 + 3 * len(vecs)
+                parts.append(fr[k])
+                vecs.append((start, start + 3))
         inp = torch.cat(parts, dim=1)
         acc: dict[str, torch.Tensor] | None = None
         for axes, tr in self.tta:
@@ -483,7 +499,9 @@ def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) 
     """``build_model`` keyword arguments recorded in a student checkpoint's ``config`` blob.
 
     Missing keys fall back to the defaults of the checkpoint's era: 2 input channels (no
-    radial field), medial surface mode, full-resolution body, GroupNorm."""
+    radial field), medial surface mode, full-resolution body, GroupNorm.  ``axis_tangent`` is
+    read by :func:`checkpoint_axis_tangent` instead -- it is a property of the *input fields*,
+    not of the architecture, so it is not a ``build_model`` argument."""
     tb = cfgb.get("train") or {}
     g = lambda k, d: cfgb.get(k, tb.get(k, d))  # noqa: E731
     w = widths or g("widths", None) or TRAIN_DEFAULTS["widths"]
@@ -500,6 +518,13 @@ def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) 
         # a checkpoint written before fiber_mode existed is a 2-channel class head
         "fiber_mode": str(g("fiber_mode", None) or "class"),
     }
+
+
+def checkpoint_axis_tangent(cfgb: dict[str, Any]) -> bool:
+    """``extra.train.axis_tangent`` of a checkpoint config blob; **False** when absent (a
+    checkpoint from before the real-tangent frame existed was trained on the constant axis)."""
+    tb = cfgb.get("train") or {}
+    return bool(cfgb.get("axis_tangent", tb.get("axis_tangent", False)))
 
 
 def student_rf_radius(ckpt: str, widths: Sequence[int] | None = None) -> int:
@@ -545,6 +570,10 @@ def load_student(path: str, device: str | torch.device = "cpu", widths: Sequence
     # checkpoints written before extra.train.input_radial existed are 2-channel
     radial = bool(cfgb.get("input_radial", tb.get("input_radial", False)))
     ax_in = bool(cfgb.get("input_axis", tb.get("input_axis", False)))
+    # ... and checkpoints written before extra.train.axis_tangent existed were trained with the
+    # constant (1, 0, 0) axis and the in-plane radial, so the default here is False, not the
+    # training default: feeding them the real tangent would be a different input distribution.
+    ax_tan = checkpoint_axis_tangent(cfgb)
     axis_path = cfgb.get("axis_path") or tb.get("axis_path") or None
     model = build_model(**kw)
     load_student_state(model, ck["model"], what=f"checkpoint {os.path.basename(path)}")
@@ -560,7 +589,7 @@ def load_student(path: str, device: str | torch.device = "cpu", widths: Sequence
     model.eval().to(device)
     return model, {"checkpoint": os.path.abspath(path), "step": int(ck.get("step", -1)), "widths": [int(v) for v in w],
                    "ema": has_ema, "surface_mode": smode, "input_radial": radial, "input_axis": ax_in,
-                   "axis_path": axis_path,
+                   "axis_tangent": ax_tan, "axis_path": axis_path,
                    "in_ch": in_channels(radial, ax_in), "input_channels": input_channels(radial, ax_in),
                    "body_stride": kw["body_stride"], "fullres_width": kw["fullres_width"], "norm": kw["norm"],
                    "fiber": bool(kw["fiber"]), "fiber_mode": str(kw["fiber_mode"]),
@@ -592,7 +621,8 @@ def extract_surface(sdf_u8: np.ndarray, valid_u8: np.ndarray, clip: float) -> np
 
 
 def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
-                               log: Callable[[str], None] | None = None) -> dict[str, Any]:
+                               log: Callable[[str], None] | None = None, axis: Any = None,
+                               origin_zyx: Sequence[int] | None = None) -> dict[str, Any]:
     """Fill the derived ``fiber_vt`` / ``fiber_hz`` channels of a ``fiber_mode="direction"``
     prediction store, brick-wise with a 1-voxel halo.
 
@@ -605,8 +635,13 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
     Only the *direction* of ``grad sdf`` matters here (it is normalised), so -- unlike the
     label-side derivation, which insists on ``|grad|`` in [0.5, 1.5] before it trusts the field
     -- any non-zero gradient is used; gating on the magnitude would silently zero the derived
-    classes wherever the predicted SDF is flatter or steeper than a true distance field."""
+    classes wherever the predicted SDF is flatter or steeper than a true distance field.
+
+    ``axis`` (an umbilicus JSON path or (N, 3) control points) makes "vertical" the **local**
+    axis tangent, built per brick at the store's absolute origin (``origin_zyx``, by default the
+    store's own ``origin_zyx`` attribute); without it the historical constant (1, 0, 0) is used."""
     from tsm.fiber import class_from_direction, fiber_basis, sheet_normal
+    from tsm.labels import axis_tangent_field
 
     log = log or (lambda m: print(m, flush=True))
     arr = zarr.open_array(store=pred_path, mode="r+")
@@ -618,6 +653,12 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
     idx = {n: ch.index(n) for n in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength",
                                     "fiber_vt", "fiber_hz", sdf_name)}
     shape = tuple(int(s) for s in arr.shape[1:])
+    ax_pts = None
+    if axis is not None:
+        from tsm.data import load_axis_spec
+
+        ax_pts = load_axis_spec(axis)
+    org = [int(v) for v in (origin_zyx if origin_zyx is not None else arr.attrs.get("origin_zyx", (0, 0, 0)))]
     t0 = time.perf_counter()
     n_ok = n_tot = 0
     for lo, hi in iter_cores(shape, (brick,) * 3):
@@ -627,7 +668,11 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
                       for k in ("fiber_dz", "fiber_dy", "fiber_dx")])
         st = decode_prob(read_box_padded(arr, lo_h, hi_h, channels=idx["fiber_strength"])[0])
         n, _ = sheet_normal(torch.from_numpy(sdf[None].astype(np.float32)), lo=1e-6, hi=float("inf"))
-        tv, th, ok = fiber_basis(n)
+        ax_fld = None
+        if ax_pts is not None:
+            ax_fld = torch.from_numpy(axis_tangent_field(
+                ax_pts, [o + l for o, l in zip(org, lo_h)], [h - l for l, h in zip(lo_h, hi_h)], scale=1))
+        tv, th, ok = fiber_basis(n, ax_fld)
         pv, ph = class_from_direction(torch.from_numpy(d.astype(np.float32)),
                                       torch.from_numpy(st[None].astype(np.float32)), tv, th)
         core = (slice(1, -1),) * 3
@@ -638,7 +683,7 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
         n_tot += int(np.prod([h - l for l, h in zip(lo, hi)]))
         del sdf, d, st, n, tv, th, ok, pv, ph
     out = {"seconds": time.perf_counter() - t0, "basis_defined_frac": (n_ok / n_tot) if n_tot else 0.0,
-           "sdf_channel": sdf_name}
+           "sdf_channel": sdf_name, "axis_tangent": ax_pts is not None}
     log(f"[infer] derived fiber_vt/fiber_hz from the direction head "
         f"(in-plane basis defined on {out['basis_defined_frac']:.4f} of the region) in {out['seconds']:.1f}s")
     return out
@@ -855,6 +900,7 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
                      input_radial=bool(info.get("input_radial", False)),
                      axis=opts.get("axis_path") or info.get("axis_path"),
                      input_axis=bool(info.get("input_axis", False)),
+                     axis_tangent=bool(info.get("axis_tangent", False)),
                      fiber_mode=str(info.get("fiber_mode", fmode))).to(device)
     print(f"[infer] loaded {info} in {time.perf_counter() - t:.1f}s, params={model.num_params() / 1e6:.2f}M", flush=True)
     reader = open_ct(cfg, 0, int(opts["probe_brick"]))
@@ -872,7 +918,12 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
                                  min_component=int(opts["min_component"]))
     fiber_derived = None
     if fiber and fmode == "direction":
-        fiber_derived = write_fiber_class_channels(pred_path, clip, brick=int(opts["chunk"]))
+        fiber_derived = write_fiber_class_channels(
+            pred_path, clip, brick=int(opts["chunk"]),
+            # the real axis tangent iff the student was trained against it
+            axis=((opts.get("axis_path") or info.get("axis_path") or DEFAULT_AXIS)
+                  if info.get("axis_tangent") else None),
+            origin_zyx=region.start_zyx)
     summary.update({
         "pred": pred_path, "channels": channels, "clip": clip, "voxel_um": voxel_um, "tta": tta_name,
         "surface_mode": smode,

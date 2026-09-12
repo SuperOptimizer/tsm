@@ -7,17 +7,19 @@ Input (B, in_ch + aux_ch, Z, Y, X), ``in_ch`` = 2 or 5:
   ch 1  constant scale channel ``log2(voxel_um / 2.4)`` (0 at 2.4 um, 2 at 9.6 um).
   ch 2..4  (``extra.train.input_radial``, default on) the outward radial direction
         ``r_z, r_y, r_x`` at every voxel: the unit vector from the scroll axis
-        (umbilicus) to that voxel, in (z, y, x) order (``labels.radial_field``, so
-        ``r_z == 0``).  Without it a 128^3 crop cannot know which way is "out", and
-        the sdf sign / winding phase sign / normal orientation -- all defined as
-        outward -- are unlearnable.  The channels are augmented exactly like the
-        winding normal target (rotated as a vector, components negated on a flip,
-        resampled and renormalised).
-  ch 5..7  (``extra.train.input_axis``, default off) the scroll-axis unit direction in
-        volume coordinates ``a_z, a_y, a_x`` -- constant (1, 0, 0) before augmentation,
-        rotated with the volume by every spatial transform (the same vector rule as the
-        radial channels).  "Vertical" fibre means "along this axis", so an all-axes
-        rotation makes the fibre classes unlearnable without it.
+        (umbilicus) to that voxel, in (z, y, x) order, **perpendicular to the local
+        axis tangent** (``labels.geometry_frame``).  Without it a 128^3 crop cannot know
+        which way is "out", and the sdf sign / winding phase sign / normal orientation --
+        all defined as outward -- are unlearnable.  The channels are augmented as tangent
+        vectors (pushed forward with ``L``, resampled and renormalised).
+  ch 5..7  (``extra.train.input_axis``, default on) the scroll-axis unit direction in
+        volume coordinates ``a_z, a_y, a_x`` -- the **local umbilicus tangent**
+        (``labels.axis_tangent_field``; a constant (1, 0, 0) with
+        ``extra.train.axis_tangent: false``), rotated with the volume by every spatial
+        transform, exactly like the radial channels.  "Vertical" fibre means "along this
+        axis", so an all-axes rotation makes the fibre classes unlearnable without it.
+        Channels 2..7 are an orthonormal pair at every voxel (re-orthonormalised after
+        augmentation); the binormal is deliberately not fed (a pseudovector).
   ch 8+ optional aux channels (refiner mode: first-pass heads, 2 + 1 + 8 = 11).
 
 Widths are multiples of 32 (FP8 / TensorRT friendly); the forward has no
@@ -54,12 +56,12 @@ from torch.utils.checkpoint import checkpoint
 
 BASE_UM = 2.4
 IN_CHANNELS = ["ct", "scale"]
-RADIAL_CHANNELS = ["r_z", "r_y", "r_x"]  # outward unit radial, (z, y, x) order
+RADIAL_CHANNELS = ["r_z", "r_y", "r_x"]  # outward unit radial (perpendicular to the axis), (z, y, x)
 # optional scroll-axis direction channels (extra.train.input_axis): the unit scroll axis in
-# volume coordinates, constant (1, 0, 0) in (z, y, x) before augmentation and rotated with the
-# volume after it.  The fibre classes ("vertical" = along the axis) and the winding field are
+# volume coordinates -- the local umbilicus tangent (a constant (1, 0, 0) with
+# extra.train.axis_tangent: false) -- rotated with the volume by every spatial transform.  The fibre classes ("vertical" = along the axis) and the winding field are
 # both defined relative to the axis, which an all-axes rotation otherwise hides from the net.
-AXIS_CHANNELS = ["a_z", "a_y", "a_x"]
+AXIS_CHANNELS = ["a_z", "a_y", "a_x"]  # unit umbilicus tangent (z, y, x); r . a == 0
 HEADS: dict[str, int] = {"surface": 2, "ink": 1, "winding": 8}
 # two-face surface mode (extra.train.surface_mode = "faces"): [sdf_in, sdf_out, valid logit]
 FACE_HEADS: dict[str, int] = {"surface": 3, "ink": 1, "winding": 8}
@@ -140,11 +142,13 @@ def normalize_ct(ct: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
 
 
 def make_input(ct: torch.Tensor, voxel_um: float | torch.Tensor,
-               radial: torch.Tensor | None = None) -> torch.Tensor:
+               radial: torch.Tensor | None = None, axis_dir: torch.Tensor | None = None) -> torch.Tensor:
     """(B, Z, Y, X) CT (uint8 or [0,1] float) -> (B, 2, Z, Y, X) network input.
 
     With ``radial`` (B, 3, Z, Y, X) -- the outward unit radial field in (z, y, x)
-    order -- the result is the 5-channel input ``[ct, scale, r_z, r_y, r_x]``."""
+    order -- the result is the 5-channel input ``[ct, scale, r_z, r_y, r_x]``; with
+    ``axis_dir`` as well (the local scroll-axis tangent, same layout) the 8-channel
+    ``[ct, scale, r_z, r_y, r_x, a_z, a_y, a_x]`` (``labels.geometry_frame`` gives both)."""
     if ct.ndim != 4:
         raise ValueError(f"ct must be (B, Z, Y, X), got {tuple(ct.shape)}")
     x = normalize_ct(ct).unsqueeze(1)
@@ -153,11 +157,18 @@ def make_input(ct: torch.Tensor, voxel_um: float | torch.Tensor,
         s = s.expand(x.shape[0], 1, *x.shape[2:])
     else:
         s = torch.full_like(x, scale_channel_value(voxel_um))
+    if axis_dir is not None and radial is None:
+        raise ValueError("axis_dir without radial: the input channel order is [ct, scale, radial, axis]")
     if radial is None:
         return torch.cat([x, s], dim=1)
-    if radial.ndim != 5 or radial.shape[1] != 3 or radial.shape[0] != x.shape[0] or tuple(radial.shape[2:]) != tuple(x.shape[2:]):
-        raise ValueError(f"radial must be (B, 3, Z, Y, X) matching the CT, got {tuple(radial.shape)}")
-    return torch.cat([x, s, radial.to(x.dtype).to(x.device)], dim=1)
+    parts = [x, s]
+    for name, v in (("radial", radial), ("axis_dir", axis_dir)):
+        if v is None:
+            continue
+        if v.ndim != 5 or v.shape[1] != 3 or v.shape[0] != x.shape[0] or tuple(v.shape[2:]) != tuple(x.shape[2:]):
+            raise ValueError(f"{name} must be (B, 3, Z, Y, X) matching the CT, got {tuple(v.shape)}")
+        parts.append(v.to(x.dtype).to(x.device))
+    return torch.cat(parts, dim=1)
 
 
 NORM_KINDS = ("group", "batch")

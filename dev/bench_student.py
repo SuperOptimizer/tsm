@@ -179,6 +179,7 @@ def build_student(cname: str, ckpt: str, device: torch.device, voxel_um: float, 
                      input_radial=bool(info.get("input_radial", False)),
                      axis=axis_path or info.get("axis_path"),
                      input_axis=bool(info.get("input_axis", False)),
+                     axis_tangent=bool(info.get("axis_tangent", False)),
                      fiber_mode=str(info.get("fiber_mode", "class"))).to(device)
     return net, info, model
 
@@ -232,7 +233,9 @@ def run_config(cname: str, box: np.ndarray, ckpt: str, cfg_path: str, results_pa
         row.update({"engine_mb": round(os.path.getsize(engine.engine_path) / (1 << 20)),
                     "trt_device_mb": round(engine.device_memory_mb)})
         net = StudentNet(engine, voxel_um, clip, tta="none", surface_mode=smode,
-                         input_radial=bool(info.get("input_radial", False)), axis=info.get("axis_path")).to(device)
+                         input_radial=bool(info.get("input_radial", False)), axis=info.get("axis_path"),
+                         input_axis=bool(info.get("input_axis", False)),
+                         axis_tangent=bool(info.get("axis_tangent", False))).to(device)
         del model
         free_cuda()
     net = prepare_net(net, spec, device)

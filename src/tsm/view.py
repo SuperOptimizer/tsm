@@ -384,6 +384,7 @@ class StudentSource(Source):
                               surface_mode=info.get("surface_mode", smode),
                               input_radial=bool(info.get("input_radial", False)),
                               axis=info.get("axis_path"), input_axis=bool(info.get("input_axis", False)),
+                              axis_tangent=bool(info.get("axis_tangent", False)),
                               fiber_mode=str(info.get("fiber_mode", fmode))).to("cuda")
         self.spec = WindowSpec(patch=int(patch), step=int(patch) // 2, out_tile=int(out_tile),
                                halo=None, batch=int(batch), tta=False, dtype=torch.bfloat16,

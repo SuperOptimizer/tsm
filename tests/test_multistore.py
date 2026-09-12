@@ -179,7 +179,9 @@ def test_single_store_path_is_unchanged(two, tmp_path):
     root = str(tmp_path / "single")
     extra = {"steps": 1, "patch": 32, "batch": 1, "accum": 1, "num_workers": 0, "stride": 16,
              "augment": False, "_ct": two["a"]["ct"], "fine_store": two["a"]["fine"],
-             "coarse_store": two["a"]["coarse"], "input_radial": False, "seed": 3}
+             # input_axis is on by default since 2026-09-12; off here so the reference
+             # CropDataset below (built with the plain defaults) has the same input channels
+             "coarse_store": two["a"]["coarse"], "input_radial": False, "input_axis": False, "seed": 3}
     cfg = _cfg(root, dict(extra))
     opts = train_opts(_cfg(root, dict(extra)))
     assert opts["stores"] is None
