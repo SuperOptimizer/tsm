@@ -289,7 +289,39 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
     return opts
 
 
-STORE_KEYS = {"name", "fine_store", "coarse_store", "axis", "voxel_um", "weight", "volume", "region"}
+STORE_KEYS = {"name", "fine_store", "coarse_store", "axis", "voxel_um", "weight", "volume", "region",
+              "holdout_box_zyx", "holdout_boxes_zyx"}
+
+
+def _holdout_box(v: Any, what: str) -> list[int]:
+    """One ``[z0, y0, x0, dz, dy, dx]`` box in scroll (level-0) voxels -> list of 6 ints.
+
+    Same convention as ``region`` (``start_zyx`` + ``size_zyx``), flattened."""
+    if not isinstance(v, (list, tuple)) or len(v) != 6:
+        raise ValueError(f"{what} must be a list of 6 ints [z0, y0, x0, dz, dy, dx], got {v!r}")
+    out = []
+    for t in v:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise ValueError(f"{what} must be a list of 6 ints [z0, y0, x0, dz, dy, dx], got {v!r}")
+        out.append(int(t))
+    if min(out[3:]) <= 0:
+        raise ValueError(f"{what} sizes (dz, dy, dx) must be positive, got {out[3:]}")
+    return out
+
+
+def _holdout_boxes(e: dict[str, Any], what: str) -> list[list[int]]:
+    """Normalise ``holdout_box_zyx`` / ``holdout_boxes_zyx`` of one store entry to a list of boxes."""
+    boxes: list[list[int]] = []
+    one = e.get("holdout_box_zyx")
+    if one is not None:
+        boxes.append(_holdout_box(one, f"{what}.holdout_box_zyx"))
+    many = e.get("holdout_boxes_zyx")
+    if many is not None:
+        if not isinstance(many, (list, tuple)) or not many:
+            raise ValueError(f"{what}.holdout_boxes_zyx must be a non-empty list of boxes")
+        for j, b in enumerate(many):
+            boxes.append(_holdout_box(b, f"{what}.holdout_boxes_zyx[{j}]"))
+    return boxes
 
 
 def store_opts(cfg: RunCfg, opts: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -301,6 +333,11 @@ def store_opts(cfg: RunCfg, opts: dict[str, Any]) -> list[dict[str, Any]] | None
     (default: the store's number of training origins, i.e. uniform over crops) and an optional
     per-store ``volume`` / ``region`` (default: the top-level ones for ``volume``, the fine store's
     own extent for ``region``, which is what the local CT cache must cover).
+
+    ``holdout_box_zyx`` (or ``holdout_boxes_zyx``, a list of them) is ``[z0, y0, x0, dz, dy, dx]`` in
+    scroll (level-0) voxels -- the same convention as ``region``, flattened.  Every crop that
+    intersects the box is moved out of the store's training origins and into its holdout origins,
+    so an evaluation region inside a training slab is never trained on.
     """
     raw = opts.get("stores")
     hold = opts.get("holdout_stores") or []
@@ -340,11 +377,12 @@ def store_opts(cfg: RunCfg, opts: dict[str, Any]) -> list[dict[str, Any]] | None
         reg = e.get("region")
         if reg is not None:
             _region(reg)
+        boxes = _holdout_boxes(e, f"extra.train.stores[{i}]")
         out.append({"name": name, "fine_store": os.path.expanduser(fine),
                     "coarse_store": os.path.expanduser(coarse) if coarse else None,
                     "axis": e.get("axis"), "voxel_um": float(vu) if vu is not None else None,
                     "weight": float(w) if w is not None else None,
-                    "volume": vol, "region": reg})
+                    "volume": vol, "region": reg, "holdout_boxes_zyx": boxes})
     names = [e["name"] for e in out]
     if len(set(names)) != len(names):
         raise ValueError(f"extra.train.stores names must be unique, got {names}")
@@ -1481,6 +1519,25 @@ def _open_ct(cfg: RunCfg, region_start: Sequence[int], probe: int = 32,
     return make
 
 
+def _box_hits(origins: np.ndarray, patch: int, boxes: Sequence[Sequence[int]],
+              store_origin_zyx: Sequence[int]) -> np.ndarray:
+    """Bool mask: which ``patch``-cube crops (local origins) intersect any global holdout box.
+
+    ``boxes`` are ``[z0, y0, x0, dz, dy, dx]`` in scroll (level-0) voxels; crop origins are local to
+    the fine store, so the box is shifted by ``store_origin_zyx`` before testing."""
+    o = np.asarray(origins, np.int64).reshape(-1, 3)
+    hit = np.zeros(len(o), bool)
+    if not len(o):
+        return hit
+    off = np.asarray([int(v) for v in store_origin_zyx], np.int64)
+    for b in boxes:
+        bb = np.asarray([int(v) for v in b], np.int64)
+        lo = bb[:3] - off
+        hi = lo + bb[3:]
+        hit |= ((o < hi[None, :]) & (o + int(patch) > lo[None, :])).all(axis=1)
+    return hit
+
+
 def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], augment: bool,
                    length: int, hold_all: bool):
     """One store of ``extra.train.stores`` -> (CropDataset, train origins, holdout origins).
@@ -1516,13 +1573,22 @@ def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], aug
     smode = str(opts.get("surface_mode", "medial"))
     valid_ch = "faces_valid" if smode == "faces" else "sdf_valid"
     origins = build_origins(fine, valid_ch, P, int(opts["stride"]), float(opts["min_valid_frac"]))
+    boxes = entry.get("holdout_boxes_zyx") or []
+    n_box = 0
     if hold_all:
         train_o, hold_o = np.zeros((0, 3), np.int32), origins
     else:
         train_o, hold_o = split_holdout(origins, P, opts.get("holdout_origins"))
+        if boxes:
+            hit = _box_hits(train_o, P, boxes, fine.origin_zyx)
+            n_box = int(hit.sum())
+            hold_o = np.concatenate([np.asarray(hold_o, np.int32).reshape(-1, 3),
+                                     np.asarray(train_o, np.int32).reshape(-1, 3)[hit]], axis=0)
+            train_o = np.asarray(train_o, np.int32).reshape(-1, 3)[~hit]
+    extra_msg = f", {n_box} in holdout box" if boxes else ""
     print(f"[tsm] store {name!r}: fine {fine.path} shape={fine.shape_zyx} origin={fine.origin_zyx} "
           f"voxel_um={fine.voxel_um}; {len(train_o)} train / {len(hold_o)} holdout origins "
-          f"(of {len(origins)}, patch {P})", flush=True)
+          f"(of {len(origins)}, patch {P}{extra_msg})", flush=True)
     ds = CropDataset(
         _open_ct(cfg, fine.origin_zyx, volume=vol, region=region), fine, coarse, patch=P,
         seed=int(opts["seed"]), length=length, stride=int(opts["stride"]),

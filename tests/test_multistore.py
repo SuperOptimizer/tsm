@@ -193,3 +193,66 @@ def test_single_store_path_is_unchanged(two, tmp_path):
         assert set(a) == set(b)
         for k in a:
             torch.testing.assert_close(a[k], b[k])
+
+
+# --------------------------------------------------------------------------- per-store holdout box
+def _box_extra(two, box, key="holdout_box_zyx", **over):
+    e = _stores_extra(two, **over)
+    e["stores"][0][key] = box
+    return e
+
+
+def test_store_holdout_box_moves_intersecting_crops(two, tmp_path):
+    """A box inside a training slab: every crop touching it is held out, none of it is trained on."""
+    from tsm.train import _box_hits
+
+    root = str(tmp_path / "box")
+    P = 32
+    # store "a" has fine origin (16, 32, 32); this is the local cube [24, 32)^3 in scroll voxels
+    box = [16 + 24, 32 + 24, 32 + 24, 8, 8, 8]
+    opts = train_opts(_cfg(root, _box_extra(two, box)))
+    assert opts["stores"][0]["holdout_boxes_zyx"] == [box] and opts["stores"][1]["holdout_boxes_zyx"] == []
+    ds = build_dataset(_cfg(root, _box_extra(two, box)), opts, augment=False)
+
+    base = build_dataset(_cfg(str(tmp_path / "nobox"), _stores_extra(two)),
+                         train_opts(_cfg(str(tmp_path / "nobox2"), _stores_extra(two))), augment=False)
+    a_all = base.origins[base.origins[:, 0] == 0][:, 1:]
+    hit = _box_hits(a_all, P, [box], (16, 32, 32))
+    assert 0 < int(hit.sum()) < len(a_all)  # a real split: some crops in, some out
+
+    train_a = ds.origins[ds.origins[:, 0] == 0][:, 1:]
+    hold_a = ds.holdout_origins[ds.holdout_origins[:, 0] == 0][:, 1:]
+    assert not _box_hits(train_a, P, [box], (16, 32, 32)).any()  # nothing trained inside the box
+    moved = {tuple(map(int, o)) for o in a_all[hit]}
+    assert moved <= {tuple(map(int, o)) for o in hold_a}  # and every one of them is held out
+    assert len(train_a) == len(a_all) - len(moved) and len(train_a) > 0
+    # store "b" (no box) is untouched
+    assert len(ds.origins[ds.origins[:, 0] == 1]) == len(base.origins[base.origins[:, 0] == 1])
+
+
+def test_store_holdout_boxes_list_and_hold_all_unchanged(two, tmp_path):
+    root = str(tmp_path / "boxes")
+    box = [16 + 24, 32 + 24, 32 + 24, 8, 8, 8]
+    opts = train_opts(_cfg(root, _box_extra(two, [box], key="holdout_boxes_zyx")))
+    assert opts["stores"][0]["holdout_boxes_zyx"] == [box]
+    # a box on a fully held-out store changes nothing: hold_all already holds every origin
+    ds = build_dataset(_cfg(root, _box_extra(two, box, holdout_stores=["a"])),
+                       train_opts(_cfg(root, _box_extra(two, box, holdout_stores=["a"]))), augment=False)
+    assert set(ds.origins[:, 0].tolist()) == {1} and set(ds.holdout_origins[:, 0].tolist()) == {0}
+    assert len(ds.holdout_origins) == len(ds.datasets[0].origins)
+
+
+def test_store_holdout_box_validation(two, tmp_path):
+    root = str(tmp_path / "badbox")
+    for bad, msg in (([1, 2, 3], "6 ints"),
+                     ([1, 2, 3, 4, 5, 6, 7], "6 ints"),
+                     ([1, 2, 3, 4.5, 5, 6], "6 ints"),
+                     ("1,2,3,4,5,6", "6 ints"),
+                     ([1, 2, 3, 0, 5, 6], "must be positive"),
+                     ([1, 2, 3, 4, -5, 6], "must be positive")):
+        with pytest.raises(ValueError, match=msg):
+            train_opts(_cfg(root, _box_extra(two, bad)))
+    with pytest.raises(ValueError, match="non-empty list of boxes"):
+        train_opts(_cfg(root, _box_extra(two, [], key="holdout_boxes_zyx")))
+    with pytest.raises(ValueError, match="holdout_boxes_zyx\\[0\\]"):
+        train_opts(_cfg(root, _box_extra(two, [[1, 2, 3]], key="holdout_boxes_zyx")))
