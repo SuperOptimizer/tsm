@@ -2,7 +2,7 @@
 
 usage: uv run python dev/eval_region.py configs/paris4_eval.json [--bricks 0] [--no-gallery]
                                        [--faces-labels <faces fine.zarr>]
-                                       [--rectoverso <rectoverso.zarr>]
+                                       [--rectoverso <rectoverso.zarr>] [--axis <umbilicus.json>]
 
 Reads (all under ``cfg.out_dir``, see docs/label_store.md):
   student/pred.zarr        sdf, valid, ink, sin, cos, density, nx, ny, nz, conf, spare, surface1
@@ -23,14 +23,19 @@ kept under ``surface_inface_vs_recto``, and, when a faces label store is found
 if it has ``sdf_in``/``sdf_out``/``faces_valid``), a ``faces`` section reports per-face
 SDF MAE / zero-crossing Dice / surface distances plus the thickness MAE.
 
-``--rectoverso`` adds the ``upstream_faces`` block -- the **only teacher-independent**
+``--rectoverso`` adds the ``upstream_faces`` / ``upstream_body`` blocks -- the **only teacher-independent**
 metric here: the student's two faces are scored against the upstream Scroll-1 recto/verso mesh
 labels resampled onto our grid (``dev/rectoverso_slab.py``), which no part of the training
 pipeline has seen.  Every other number in this report compares the student with the teachers it
 was distilled from, or with labels derived from them.  It also adds ``upstream_topology``: the
 same comparison counted in *sheets* rather than voxels (merges, breaks, missed and spurious
 connected components), reported in its own section and never combined with the voxel-wise
-``upstream_faces`` numbers.  Its reference objects are the **unthinned** upstream bands (the
+``upstream_faces`` numbers.  ``upstream_body`` is the orientation-free version of the same
+comparison -- the thinned union of recto/verso/contact against ``surface_body1`` (body store) or
+``surface_in1 | surface_out1`` (two-face store), so a faces baseline and a body run are directly
+comparable and a global swap of the two predicted faces cannot change the score -- and
+``upstream_topology`` gains a matching ``body`` entry whose student objects are the predicted
+sheet bodies.  Its reference objects are the **unthinned** upstream bands (the
 thinned centre planes shatter into >100k fragments and would turn reference fragmentation into
 model merges); only its distances and Dice use the thinned planes.
 
@@ -56,10 +61,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tsm.cli import open_ct  # noqa: E402
 from tsm.config import load_config  # noqa: E402
-from tsm.data import CLIP, WF_CHANNELS, decode_density, decode_signed  # noqa: E402
+from tsm.data import CLIP, WF_CHANNELS, body_sdf, decode_density, decode_signed  # noqa: E402
 from tsm.equivariance import average_precision, surface_distances  # noqa: E402
 from tsm.infer import _pool_winding, decode_pred  # noqa: E402
 from tsm.labels import (  # noqa: E402
+    DEFAULT_AXIS,
     _drop_small_components,
     decode_lasagna_normal,
     decode_sdf_u8,
@@ -224,12 +230,18 @@ def _pcts(v: np.ndarray, name: str) -> dict[str, Any]:
 def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Store | None,
                lo: list[int], hi: list[int], clip: float, budget, brick=(64, 512, 512),
                sample_cap: int = 2_000_000, fiber_t: Store | None = None,
-               wf_store: Store | None = None) -> tuple[dict[str, Any], np.ndarray]:
+               wf_store: Store | None = None, flab: Store | None = None
+               ) -> tuple[dict[str, Any], np.ndarray]:
     """Accumulate every voxel-wise metric and return (metrics, the student surface1 mask).
 
     ``wf_store`` is where the native winding target (``wf_*``) is read from: the eval fine
     store when it carries the block, else (e.g. when only the faces label store was
     rebuilt with ``extra.labels.winding_fine``) the store passed here.
+
+    In the orientation-free **body** mode (the prediction store carries ``sdf_body``) the label
+    side is not ``fine`` but the two-face store ``flab``: the reference is
+    ``tsm.data.body_sdf(sdf_in, sdf_out)`` on ``faces_valid == 1`` voxels, the single definition
+    the dataset and the training metrics use, so nothing here re-derives it.
 
     Bricks are 4-aligned (the winding comparison pools the student by 4); every decoded
     brick costs about 12 uint8 + 11 float32 planes, so ``brick`` bounds the working set."""
@@ -262,30 +274,54 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
     med_cov = Mean()  # fraction of the predicted sheet interior where the medial surface is defined
     n_coarse_valid = 0
     st = ndi.generate_binary_structure(3, 3)  # "within 1 voxel" = Chebyshev distance 1
-    surf_ch = next((c for c in ("surface1", "surface_in1") if c in pred.channels), None)
+    surf_ch = next((c for c in ("surface1", "surface_in1", "surface_body1") if c in pred.channels), None)
     # in the two-face mode the label `sdf` is the MEDIAL sdf, so compare it with the student
     # medial (equidistance between the faces), not with the in face (half a sheet away)
     faces = pred.has("sdf_in") and pred.has("sdf_out")
+    body = pred.has("sdf_body")
+    if body and flab is None:
+        log("WARNING body mode without a faces label store: no label-side body SDF comparison")
+    lab = flab if body else fine          # which store the surface comparison reads
+    do_lab = lab is not None
+    # body mode: the body target, its zero set and the per-voxel agreement of the two bodies
+    bdice, b_inter, b_union, n_pred_body, n_label_body, n_faces_valid1 = DiceCount(), 0, 0, 0, 0, 0
+    # fibre exclusivity (no teacher needed): the two derived class channels must not both fire
+    fib_ch = pred.has("fiber_vt") and pred.has("fiber_hz")
+    i_vt = pred.channels.index("fiber_vt") if fib_ch else -1
+    i_hz = pred.channels.index("fiber_hz") if fib_ch else -1
+    n_fib_both = n_fib_any = n_data = 0
 
     for z, y, x in starts:
         blo = [z, y, x]
         bhi = [min(z + b[0], hi[0]), min(y + b[1], hi[1]), min(x + b[2], hi[2])]
         u8 = pred.read(blo, bhi)
         dec = decode_pred(u8, clip, pred.channels)
-        s1 = dec.get("surface1", dec.get("surface_in1"))
+        s1 = dec.get("surface1", dec.get("surface_in1", dec.get("surface_body1")))
         sl = tuple(slice(l0 - l, h0 - l) for l0, h0, l in zip(blo, bhi, lo))
         surf[sl] = s1 if s1 is not None else np.zeros_like(dec["data"])
         pvalid = dec["data"] & (dec["valid"] > 0.5)
 
-        if fine is not None:
+        if do_lab:
             # a 1-voxel halo so the zero crossing and the within-1 dilation are exact at brick edges
             hlo = [max(l, v - 1) for v, l in zip(blo, lo)]
             hhi = [min(h, v + 1) for v, h in zip(bhi, hi)]
             cs = tuple(slice(v - h, v - h + (e - v)) for v, e, h in zip(blo, bhi, hlo))
-            f = fine.read(hlo, hhi, ["sdf", "sdf_valid"])
-            lsdf = decode_sdf_u8(f[0], clip) * (f[0] != 0)
-            lvalid = f[1] == 1
-            lzc = _thin_zc(lsdf, f[0] != 0, lvalid)
+            pcore = dec["sdf_body"] if body else dec["sdf"]
+            if body:
+                # the label-side body SDF is min(sdf_in, -sdf_out) of the SAME faces store the
+                # dataset reads (tsm.data.body_sdf), masked by faces_valid
+                f = lab.read(hlo, hhi, ["sdf_in", "sdf_out", "faces_valid"])
+                ldata = (f[0] != 0) & (f[1] != 0)
+                lsdf = body_sdf(decode_sdf_u8(f[0], clip), decode_sdf_u8(f[1], clip)) * ldata
+                lvalid = f[2] == 1
+                lvraw = f[2]
+            else:
+                f = lab.read(hlo, hhi, ["sdf", "sdf_valid"])
+                ldata = f[0] != 0
+                lsdf = decode_sdf_u8(f[0], clip) * ldata
+                lvalid = f[1] == 1
+                lvraw = f[1]
+            lzc = _thin_zc(lsdf, ldata, lvalid)
             if faces:
                 u = pred.read(hlo, hhi, ["sdf_in", "sdf_out"])
                 s1h = medial_zc_from_faces(u[0], u[1], clip)
@@ -301,9 +337,20 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
                 + int((lzc & ndi.binary_dilation(s1h, st))[cs].sum())
             zc["n_pred"] += int(s1h[cs].sum())
             zc["n_label"] += int(lzc[cs].sum())
-            lsdf, lvalid, lv2 = lsdf[cs], lvalid[cs], f[1][cs]
+            lsdf, lvalid, lv2 = lsdf[cs], lvalid[cs], lvraw[cs]
             band = lvalid & (np.abs(lsdf) < clip) & dec["data"]
-            sdf_mae.add(np.abs((psdf[cs] if psdf is not None else dec["sdf"]) - lsdf), band)
+            sdf_mae.add(np.abs((psdf[cs] if psdf is not None else pcore) - lsdf), band)
+            if body:
+                # per-voxel agreement of the two BODIES (sdf > 0), the orientation-free object
+                dom = lvalid & dec["data"]
+                pb, lb = (pcore > 0) & dom, (lsdf > 0) & dom
+                bdice.add(pb, lb)
+                b_inter += int((pb & lb).sum())
+                b_union += int((pb | lb).sum())
+                n_pred_body += int(pb.sum())
+                n_label_body += int(lb.sum())
+                n_faces_valid1 += int(lvalid.sum())
+                del dom, pb, lb
             # evaluation domain: drop only the ignore band (validity 2) and restrict to the data
             # domain of the *prediction* store, which is independent of the labels.  The label SDF
             # byte must NOT take part: byte 0 is exactly the validity-0 class, so requiring
@@ -311,7 +358,7 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
             sel = (lv2 != 2) & dec["data"]
             if sel.any():
                 valid_ap.add(dec["valid"][sel], lvalid[sel], n_bricks)
-            del f, lsdf, lvalid, lv2, band, lzc, s1h, psdf
+            del f, ldata, lvraw, lsdf, lvalid, lv2, band, lzc, s1h, psdf, pcore
 
         if ink_t is not None:
             it = ink_t.read(blo, bhi)[0]
@@ -319,6 +366,15 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
             ink_dice.add(dec["ink"] >= 0.5, tgt)
             ink_ap.add(dec["ink"], tgt, n_bricks)
             del it, tgt
+
+        n_data += int(dec["data"].sum())
+        if fib_ch:
+            # exclusivity of the two derived class channels: no teacher involved, so this is a
+            # property of the student alone (labels overlap on 0 % of their firing voxels)
+            vt_b, hz_b = u8[i_vt] > 127, u8[i_hz] > 127
+            n_fib_both += int((vt_b & hz_b).sum())
+            n_fib_any += int((vt_b | hz_b).sum())
+            del vt_b, hz_b
 
         if do_fiber:
             ft = fiber_t.read(blo, bhi, ["fiber_vt", "fiber_hz"])
@@ -343,7 +399,8 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
             del wf, wm
 
         if coarse is not None and all((h - l) % 4 == 0 for l, h in zip(blo, bhi)):
-            pw = _pool_winding(dec, pvalid, 4)
+            # _pool_winding wants "sdf" (the cover mask); decode_pred only aliases sdf_in
+            pw = _pool_winding(dec if "sdf" in dec else {**dec, "sdf": dec["sdf_body"]}, pvalid, 4)
             c = coarse.read([v // 4 for v in blo], [-(-v // 4) for v in bhi],
                             ["phase_sin", "phase_cos", "density", "nx", "ny", "nz", "conf", "valid"])
             sh = [min(a_, b_) for a_, b_ in zip(c.shape[1:], pw["cos"].shape)]
@@ -371,7 +428,7 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
     ph_a = np.concatenate(ph) if ph else np.zeros(0, np.float32)
     na_a = np.concatenate(nang) if nang else np.zeros(0, np.float32)
     m: dict[str, Any] = {
-        "surface": {"student_surface": "medial_from_faces" if faces else "sdf",
+        "surface": {"student_surface": "medial_from_faces" if faces else ("body_sdf" if body else "sdf"),
                     "sdf_mae_band": sdf_mae.value, "sdf_mae_n": sdf_mae.n,
                     "valid_auprc": valid_ap.auprc(), "valid_auprc_n": valid_ap.n,
                     "zc_dice_within1": (zc["hit"] / (zc["n_pred"] + zc["n_label"])) if (zc["n_pred"] + zc["n_label"]) else None,
@@ -390,8 +447,24 @@ def voxel_pass(pred: Store, fine: Store | None, coarse: Store | None, ink_t: Sto
         naf_a = np.concatenate(nang_f) if nang_f else np.zeros(0, np.float32)
         m["winding_fine"] = {**_pcts(phf_a, "phase_err_deg"), **_pcts(naf_a, "normal_err_deg"),
                              "density_mae": dens_mae_f.value, "n_wf_valid": n_wf_valid}
+    fib: dict[str, Any] = {}
     if do_fiber:  # only when both the prediction and an eval-region fiber teacher carry the channels
-        m["fiber"] = {k: {"auprc": fiber_ap[k].auprc(), "auprc_n": fiber_ap[k].n} for k in ("vt", "hz")}
+        fib.update({k: {"auprc": fiber_ap[k].auprc(), "auprc_n": fiber_ap[k].n} for k in ("vt", "hz")})
+    if fib_ch:
+        # vt and hz are two independent sigmoids; a voxel firing both is a fibre the student
+        # could not orient.  The labels overlap on 0 % of their firing voxels (target <= 0.15).
+        fib.update({"overlap_frac": n_fib_both / max(1, n_fib_any),
+                    "firing_frac": n_fib_any / max(1, n_data),
+                    "n_any": n_fib_any, "n_both": n_fib_both, "n_data": n_data})
+    if fib:
+        m["fiber"] = fib
+    if body and do_lab:
+        m["body"] = {"labels": lab.path, "target": "min(sdf_in, -sdf_out)",
+                     "n_faces_valid1": n_faces_valid1,
+                     "body_dice": bdice.value,
+                     "body_iou": (b_inter / b_union) if b_union else None,
+                     "body_vol_ratio": (n_pred_body / n_label_body) if n_label_body else None,
+                     "n_pred_body": n_pred_body, "n_label_body": n_label_body}
     return m, surf
 
 
@@ -593,7 +666,7 @@ def faces_pass(pred: Store, flab: Store, lo, hi, clip: float, budget, brick=(64,
 # upstream (teacher-independent) fibre metrics
 # --------------------------------------------------------------------------- #
 def fiber_upstream_pass(pred: Store, band: Store, band_channel: str, lo, hi, clip: float, budget,
-                        brick=(64, 512, 512)) -> dict[str, Any]:
+                        brick=(64, 512, 512), axis: Any = None) -> dict[str, Any]:
     """The student's fibre prediction against the **human** hz/vt bands (``hzvt_class``).
 
     The reference is the upstream traced fibre classes (0 bg / 1 hz / 2 vt / 3 exclude), which
@@ -605,12 +678,23 @@ def fiber_upstream_pass(pred: Store, band: Store, band_channel: str, lo, hi, cli
     * ``angle_deg_*`` -- only for a ``fiber_mode="direction"`` store: the **axial** angle
       between the predicted direction and the human class's in-plane direction
       (``t_v`` / ``t_h`` from the predicted ``grad sdf_in`` and the scroll axis, tsm.fiber).
+
+    ``axis`` (an umbilicus JSON path or (N, 3) control points) makes "vertical" the **local**
+    axis tangent (``tsm.labels.axis_tangent_field``, built per brick at the brick's absolute
+    origin), exactly as ``infer.write_fiber_class_channels`` does; without it the historical
+    constant (1, 0, 0) is used and a tilted scroll is scored against the wrong basis.
     """
     import torch
 
     from tsm.fiber import fiber_basis, sheet_normal
+    from tsm.labels import axis_tangent_field
 
-    sdf_ch = "sdf_in" if pred.has("sdf_in") else "sdf"
+    ax_pts = None
+    if axis is not None:
+        from tsm.data import load_axis_spec
+
+        ax_pts = load_axis_spec(axis)
+    sdf_ch = next((k for k in ("sdf_in", "sdf_body", "sdf") if pred.has(k)), "sdf")
     has_dir = all(pred.has(c) for c in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength"))
     n_hit = n_band = 0
     angs: list[np.ndarray] = []
@@ -630,7 +714,11 @@ def fiber_upstream_pass(pred: Store, band: Store, band_channel: str, lo, hi, cli
             sdf = decode_sdf_u8(u[0], clip) * data
             # any non-zero gradient defines the basis direction (as in infer.write_fiber_class_channels)
             n, _ = sheet_normal(torch.from_numpy(sdf[None].astype(np.float32)), lo=1e-6, hi=float("inf"))
-            tv, th, ok = fiber_basis(n)
+            ax_fld = None
+            if ax_pts is not None:
+                ax_fld = torch.from_numpy(axis_tangent_field(
+                    ax_pts, hlo, [h - l for l, h in zip(hlo, hhi)], scale=1))
+            tv, th, ok = fiber_basis(n, ax_fld)
             d = np.stack([decode_signed(pred.read(hlo, hhi, [k])[0])
                           for k in ("fiber_dz", "fiber_dy", "fiber_dx")]).astype(np.float32)
             dt = torch.from_numpy(d)
@@ -642,7 +730,9 @@ def fiber_upstream_pass(pred: Store, band: Store, band_channel: str, lo, hi, cli
                 angs.append(np.degrees(np.arccos(cosv[cs][m])).astype(np.float32))
         log(f"fiber upstream brick {blo} -> {bhi} done")
     out: dict[str, Any] = {"store": band.path, "channel": band_channel, "teacher_independent": True,
-                           "n_band": n_band, "class_acc": (n_hit / n_band) if n_band else None}
+                           "n_band": n_band, "class_acc": (n_hit / n_band) if n_band else None,
+                           "axis_tangent": ax_pts is not None,
+                           "axis": str(axis) if isinstance(axis, (str, os.PathLike)) else None}
     if has_dir:
         out.update(_pcts(np.concatenate(angs) if angs else np.zeros(0, np.float32), "angle_deg"))
     return out
@@ -718,6 +808,104 @@ def upstream_faces_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 512, 
             for k in ("n", "median", "p90", "frac_gt3", "frac_gt5", "mean"):
                 r[f"{key}_{k}"] = d[side].get(k)
         out[name] = r
+    return out
+
+
+def body_pred_mask(pred: Store, lo, hi, clip: float, valid_min: int = 128) -> np.ndarray:
+    """The predicted **sheet body** of a block, for either store kind.
+
+    Body store: ``sdf_body > 0`` (``tsm.data.body_sdf`` is positive strictly inside a sheet and
+    0 on both faces *and* on a labelled contact plane, so touching sheets stay distinct
+    components).  Two-face store: the same set written in the old parametrisation,
+    ``sdf_in > 0 > sdf_out`` -- which is what lets the existing faces baselines be scored with
+    the orientation-free metrics without retraining.  Both are restricted to ``valid >= 128``
+    when the store carries a ``valid`` channel."""
+    if pred.has("sdf_body"):
+        need = ["sdf_body"]
+    elif pred.has("sdf_in") and pred.has("sdf_out"):
+        need = ["sdf_in", "sdf_out"]
+    else:
+        raise ValueError(f"{pred.path} has neither sdf_body nor sdf_in/sdf_out (has {pred.channels})")
+    has_valid = pred.has("valid")
+    u = pred.read(lo, hi, need + (["valid"] if has_valid else []))
+    if len(need) == 1:
+        m = (u[0] != 0) & (decode_sdf_u8(u[0], clip) > 0.0)
+    else:
+        m = ((u[0] != 0) & (u[1] != 0) & (decode_sdf_u8(u[0], clip) > 0.0)
+             & (decode_sdf_u8(u[1], clip) < 0.0))
+    if has_valid:
+        m &= u[-1] >= int(valid_min)
+    return m
+
+
+def body_surface_mask(pred: Store, lo, hi) -> np.ndarray:
+    """The predicted thin **sheet-side** mask, unordered: ``surface_body1`` for a body store,
+    ``surface_in1 | surface_out1`` for a two-face store (the union forgets which side is which,
+    which is exactly what the upstream recto/verso union is scored against)."""
+    if pred.has("surface_body1"):
+        return pred.read(lo, hi, ["surface_body1"])[0] > 127
+    if pred.has("surface_in1") and pred.has("surface_out1"):
+        p = pred.read(lo, hi, ["surface_in1", "surface_out1"])
+        return (p[0] > 127) | (p[1] > 127)
+    raise ValueError(f"{pred.path} has no surface_body1 / surface_in1+surface_out1 (has {pred.channels})")
+
+
+def upstream_body_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 512, 512),
+                       near: float = UPSTREAM_NEAR, tol: int = UPSTREAM_DICE_TOL,
+                       min_component: int = 32) -> dict[str, Any]:
+    """The **orientation-free** companion of :func:`upstream_faces_pass`: one unordered score.
+
+    The reference is the thinned union of *all* upstream classes -- recto, verso and contact --
+    so it says "this voxel is a side of a sheet" and never which side.  The prediction is
+    ``surface_body1`` for a body store and ``surface_in1 | surface_out1`` for a two-face store
+    (:func:`body_surface_mask`), which gives the existing faces baselines an unordered number
+    without retraining and makes the two recipes directly comparable.
+
+    Because neither side of the comparison is named, the score is **invariant under a global
+    swap of the two predicted faces**, while the per-face ``upstream_faces`` Dice collapses --
+    that swap is exactly the failure mode the body target removes.
+
+    Same restriction, tolerance and keys as :func:`upstream_faces_pass` (one block, not one per
+    face): ``dice_within2``, the pred->band / band->pred / symmetric distances, ``n_pred`` and
+    ``n_band``.
+    """
+    from tsm.rvfaces import thin_band
+
+    dz, dy, dx = (h - l for l, h in zip(lo, hi))
+    check_alloc((dz, dy, dx), np.bool_, budget)
+    a = np.zeros((dz, dy, dx), bool)   # prediction, restricted to the near-band region
+    b = np.zeros((dz, dy, dx), bool)   # thinned upstream band (recto U verso U contact)
+    n_near = 0
+    halo = int(max(near, tol, 4)) + 4
+    st = ndi.generate_binary_structure(3, 3)
+
+    for blo, bhi in _bricks(lo, hi, brick):
+        hlo, hhi, cs = _halo(blo, bhi, lo, hi, halo)
+        c = rv.read(hlo, hhi, ["rectoverso"])[0]
+        anyband = c > 0
+        nearmask = (ndi.distance_transform_edt(~anyband) <= float(near)) if anyband.any() \
+            else np.zeros(c.shape, bool)
+        dst = _dest(blo, bhi, lo)
+        n_near += int(nearmask[cs].sum())
+        b[dst] = thin_band(anyband, min_component)[cs]
+        a[dst] = (body_surface_mask(pred, hlo, hhi) & nearmask)[cs]
+        del c, anyband, nearmask
+        log(f"upstream body brick {blo} -> {bhi} done")
+
+    hit = int((a & ndi.binary_dilation(b, st, iterations=int(tol))).sum()) \
+        + int((b & ndi.binary_dilation(a, st, iterations=int(tol))).sum())
+    d = surface_distances(a, b)
+    out: dict[str, Any] = {
+        "store": rv.path, "near": float(near), "dice_tol": int(tol), "n_near_band": n_near,
+        "teacher_independent": True, "unordered": True,
+        "reference": "thin_band(rectoverso > 0): recto U verso U contact, unordered",
+        "prediction": "surface_body1" if pred.has("surface_body1") else "surface_in1 | surface_out1",
+        f"dice_within{int(tol)}": (hit / (int(a.sum()) + int(b.sum()))) if (a.sum() + b.sum()) else None,
+        "n_pred": int(a.sum()), "n_band": int(b.sum()),
+    }
+    for side, key in (("a_to_b", "pred_to_band"), ("b_to_a", "band_to_pred"), ("symmetric", "symmetric")):
+        for k in ("n", "median", "p90", "frac_gt3", "frac_gt5", "mean"):
+            out[f"{key}_{k}"] = d[side].get(k)
     return out
 
 
@@ -991,7 +1179,7 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
                            tol: int = UPSTREAM_DICE_TOL, dilate: int = TOPO_DILATE,
                            cover_frac: float = TOPO_COVER, partial_frac: float = TOPO_PARTIAL,
                            min_component: int = 32, min_size: int = TOPO_MIN_SIZE,
-                           split_contact: bool = True) -> dict[str, Any]:
+                           split_contact: bool = True, clip: float = CLIP) -> dict[str, Any]:
     """Connected-component (Betti-0) agreement of the student's faces with the **upstream** bands.
 
     Companion of :func:`upstream_faces_pass`, on the same recto/verso bands and the same
@@ -1020,6 +1208,13 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
     mask.  There is no separate ``rv_class`` channel in ``rectoverso.zarr`` -- the contact class
     is carried by the ``rectoverso`` channel itself (channels: ``rectoverso``, ``hzvt``).
 
+    **The unordered ``body`` entry.**  Besides the per-face ``in`` / ``out`` entries (two-face
+    stores only) there is always a ``body`` entry: reference objects = the 26-components of
+    ``rectoverso > 0`` (recto U verso U contact, split at the contact planes exactly as the
+    per-face entries are), student objects = the 26-components of the predicted sheet *body*
+    (:func:`body_pred_mask`).  It is the sheet-count companion of :func:`upstream_body_pass` and
+    the only topology number a body store has.
+
     The student mask is taken within ``near + margin`` voxels of a band so that a component is
     not cut in half by the restriction itself; the strict ``near`` region still gates which
     student components can be called spurious, and the Dice repeated here is the
@@ -1037,10 +1232,13 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
     from tsm.rvfaces import RV_CONTACT, RV_RECTO, RV_VERSO, thin_band
 
     dz, dy, dx = (h - l for l, h in zip(lo, hi))
-    faces = ("in", "out")
+    # a body store has no named faces; a two-face store gets the per-face entries AND the
+    # unordered `body` one, so an existing baseline can be read on both scales at once
+    faces = () if pred.has("sdf_body") else ("in", "out")
+    parts = (*faces, "body")
     check_alloc((dz, dy, dx), np.bool_, budget)
     check_alloc((dz, dy, dx), np.uint8, budget)
-    masks = {(w, f): np.zeros((dz, dy, dx), bool) for w in ("pred", "band") for f in faces}
+    masks = {(w, f): np.zeros((dz, dy, dx), bool) for w in ("pred", "band") for f in parts}
     nearm = np.zeros((dz, dy, dx), bool)
     rvc = np.zeros((dz, dy, dx), np.uint8)   # the upstream class, kept for the unthinned objects
     wide = float(near) + float(margin)
@@ -1049,8 +1247,8 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
     for blo, bhi in _bricks(lo, hi, brick):
         hlo, hhi, cs = _halo(blo, bhi, lo, hi, halo)
         c = rv.read(hlo, hhi, ["rectoverso"])[0]
-        p = pred.read(hlo, hhi, ["surface_in1", "surface_out1"])
-        bands = {"in": (c == RV_RECTO) | (c == RV_CONTACT), "out": (c == RV_VERSO) | (c == RV_CONTACT)}
+        bands = {"in": (c == RV_RECTO) | (c == RV_CONTACT), "out": (c == RV_VERSO) | (c == RV_CONTACT),
+                 "body": c > 0}
         anyband = c > 0
         d = ndi.distance_transform_edt(~anyband) if anyband.any() \
             else np.full(c.shape, np.inf, np.float32)
@@ -1058,10 +1256,17 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
         dst = _dest(blo, bhi, lo)
         nearm[dst] = (d <= float(near))[cs]
         rvc[dst] = c[cs]
-        for i, name in enumerate(faces):
+        if faces:
+            p = pred.read(hlo, hhi, ["surface_in1", "surface_out1"])
+            for i, name in enumerate(faces):
+                masks[("pred", name)][dst] = ((p[i] > 127) & (d <= wide))[cs]
+            del p
+        for name in parts:
             masks[("band", name)][dst] = thin_band(bands[name], min_component)[cs]
-            masks[("pred", name)][dst] = ((p[i] > 127) & (d <= wide))[cs]
-        del c, p, bands, d
+        # the unordered entry counts SHEETS, so its student objects are the predicted bodies
+        # (sdf_body > 0, or sdf_in > 0 > sdf_out), not the thin faces
+        masks[("pred", "body")][dst] = (body_pred_mask(pred, hlo, hhi, clip) & (d <= wide))[cs]
+        del c, bands, d
         log(f"upstream topology brick {blo} -> {bhi} done")
 
     contact = bool(split_contact) and bool((rvc == RV_CONTACT).any())
@@ -1082,22 +1287,29 @@ def upstream_topology_pass(pred: Store, rv: Store, lo, hi, budget, brick=(64, 51
                     f"n_ref_thin_fragments is what the *thinned* centre planes shatter into -- "
                     f"only the distances and dice_within{int(tol)} are measured on those"),
     }
-    for name in faces:
-        cls = RV_RECTO if name == "in" else RV_VERSO
+    for name in parts:
         # the unthinned band and its contact-free core are built here and referenced nowhere else,
         # so face_topology can (and does) free them as soon as it has the band-voxel arrays
-        out[name] = face_topology((rvc == cls) | (rvc == RV_CONTACT), masks[("pred", name)], nearm,
-                                  thin=masks[("band", name)],
-                                  core=(rvc == cls) if contact else None,
+        if name == "body":
+            band_m = rvc > 0
+            core_m = ((rvc == RV_RECTO) | (rvc == RV_VERSO)) if contact else None
+        else:
+            cls = RV_RECTO if name == "in" else RV_VERSO
+            band_m = (rvc == cls) | (rvc == RV_CONTACT)
+            core_m = (rvc == cls) if contact else None
+        out[name] = face_topology(band_m, masks[("pred", name)], nearm,
+                                  thin=masks[("band", name)], core=core_m,
                                   dilate=dilate, cover_frac=cover_frac, partial_frac=partial_frac,
                                   min_size=min_size, tol=tol)
+        del band_m, core_m
         log(f"upstream topology {name}: {out[name]['n_ref_objects']} reference objects "
             f"({out[name]['n_ref_objects_all']} before the min_size cut, "
             f"{out[name]['n_ref_thin_fragments']} thinned fragments), "
             f"{out[name]['merges']} merges, {out[name]['breaks']} breaks, "
             f"{out[name]['missed']} missed, {out[name]['spurious']} spurious")
     del nearm, rvc
-    out["inout_cross_links"] = inout_cross_links(masks[("pred", "in")], masks[("pred", "out")])
+    if faces:  # a body store has no two faces to cross-link
+        out["inout_cross_links"] = inout_cross_links(masks[("pred", "in")], masks[("pred", "out")])
     return out
 
 
@@ -1216,11 +1428,13 @@ def gallery(ed: str, cfg, pred: Store, stores: dict[str, Store | None], lo, hi, 
         cut = (lambda a: a[sl_z - lo[0], ys, xs]) if sl_z is not None else (lambda a: a[:, ys, x_cut - lo[2]])
         smed = cut(medial) if medial is not None else cut(surf)
         med_tag = "medial-from-faces red / recto medial green" if medial is not None \
-            else "surface1 red / recto medial green"
+            else ("surface_body1 red / recto medial green" if "sdf_body" in p
+                  else "surface1 red / recto medial green")
         ps = [
             _label(_g(np.clip(ct.astype(np.float32) * 1.4, 0, 255).astype(np.uint8)), f"CT {tag}"),
             _label(_g(r if r is not None else np.zeros_like(ct)), "recto teacher"),
-            _label(_sdf_rgb(p["sdf"], p["data"]), "student sdf (yellow = 0)"),
+            _label(_sdf_rgb(p.get("sdf", p.get("sdf_body")), p["data"]),
+                   "student sdf_body (yellow = 0)" if "sdf_body" in p else "student sdf (yellow = 0)"),
             _label(_overlay(ct, [(smed, (255, 40, 40)), (rmed, (40, 255, 40))]), med_tag),
             _label(_g(ik if ik is not None else np.zeros_like(ct)), "ink teacher"),
             _label(_g((p["ink"] * 255).astype(np.uint8)), "student ink"),
@@ -1277,8 +1491,8 @@ def to_markdown(m: dict[str, Any]) -> str:
     L = ["# Student vs teachers/labels on the eval region", "",
          f"region start {m['region']['start_zyx']} size {m['region']['size_zyx']} "
          f"(clip {m['clip']}, {m['seconds']:.0f}s)", ""]
-    for section in ("surface", "faces", "upstream_faces", "surface_inface_vs_recto", "ink", "fiber",
-                    "winding", "winding_fine"):
+    for section in ("surface", "faces", "body", "upstream_faces", "upstream_body",
+                    "surface_inface_vs_recto", "ink", "fiber", "winding", "winding_fine"):
         if section not in m:
             continue
         L += [f"## {section}", "", "| metric | value |", "|---|---|"]
@@ -1290,16 +1504,19 @@ def to_markdown(m: dict[str, Any]) -> str:
                 L.append(f"| {k} | {_fmt(v)} |")
         L.append("")
     tp = m.get("upstream_topology") or {}
-    if tp:
+    # one `body` column for a body store, in / out / body for a two-face one
+    cols = [c for c in ("in", "out", "body") if isinstance(tp.get(c), dict)]
+    if tp and cols:
         # kept out of the section loop above on purpose: these are sheet counts, never to be
         # averaged into or read alongside the voxel-wise upstream_faces numbers
         L += ["## Topology vs upstream bands", "",
               tp.get("caption", "merge = one predicted sheet spans two labelled sheets; "
                                 "break = one labelled sheet split across several predictions"), "",
-              "| metric | in | out |", "|---|---|---|"]
-        keys = list(tp.get("in", {}))
+              "| metric | " + " | ".join(c for c in cols) + " |",
+              "|---|" + "---|" * len(cols)]
+        keys = list(tp.get(cols[0], {})) if cols else []
         for k in keys:
-            L.append(f"| {k} | {_fmt(tp['in'].get(k))} | {_fmt(tp.get('out', {}).get(k))} |")
+            L.append(f"| {k} | " + " | ".join(_fmt(tp.get(c, {}).get(k)) for c in cols) + " |")
         L.append("")
         cl = tp.get("inout_cross_links") or {}
         if cl:
@@ -1319,6 +1536,30 @@ def to_markdown(m: dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+def resolve_axis(cfg, explicit: str | None) -> str | None:
+    """``--axis``, else ``extra.labels.axis_path``, else ``extra.train.axis_path``, else
+    :data:`tsm.labels.DEFAULT_AXIS`; ``None`` when nothing exists on disk (legacy constant axis).
+
+    ``--axis none`` forces the constant (1, 0, 0) "vertical" of every run before 2026-09-12."""
+    if explicit is not None and str(explicit).lower() in ("none", "off", ""):
+        return None
+    cand = explicit
+    if cand is None:
+        extra = getattr(cfg, "extra", None) or {}
+        for sect in ("labels", "train"):
+            v = (extra.get(sect) or {}).get("axis_path")
+            if v:
+                cand = v
+                break
+    if cand is None:
+        cand = DEFAULT_AXIS
+    cand = os.path.expanduser(str(cand))
+    if not os.path.exists(cand):
+        log(f"WARNING axis {cand} not found; the fibre 'vertical' stays the constant (1, 0, 0)")
+        return None
+    return cand
+
+
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("config")
@@ -1330,7 +1571,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("--slices", type=int, default=3)
     ap.add_argument("--rectoverso", default=None,
                     help="rectoverso.zarr (dev/rectoverso_slab.py) -> the teacher-independent "
-                         "`upstream_faces` block: the student's two faces vs the upstream bands")
+                         "`upstream_faces` / `upstream_body` blocks: the student's surfaces vs "
+                         "the upstream bands")
+    ap.add_argument("--axis", default=None,
+                    help="umbilicus JSON for the fibre 'vertical' direction (default: "
+                         "extra.labels.axis_path, else extra.train.axis_path, else "
+                         "tsm.labels.DEFAULT_AXIS); 'none' forces the legacy constant (1, 0, 0)")
     a = ap.parse_args(argv)
     t0 = time.perf_counter()
     cfg = load_config(a.config)
@@ -1350,11 +1596,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     fine = open_store(os.path.join(out, "labels", "fine.zarr"))
     coarse = open_store(os.path.join(out, "labels", "coarse.zarr"), 4)
     faces_mode = pred.has("sdf_in") and pred.has("sdf_out")
-    flab = resolve_faces_labels(out, a.faces_labels) if faces_mode else None
+    # orientation-free body mode: one SDF channel, tsm.data.body_sdf (no named faces)
+    body_mode = pred.has("sdf_body")
+    flab = resolve_faces_labels(out, a.faces_labels) if (faces_mode or body_mode) else None
     for n, s in [("pred", pred), ("fine", fine), ("coarse", coarse), ("faces_labels", flab)] + list(stores.items()):
         log(f"{n}: " + (f"{s.path} shape={s.shape} origin={s.origin} channels={s.channels}" if s else "missing"))
-    log(f"surface mode: {'faces' if faces_mode else 'medial'}")
-    if a.faces_labels and not faces_mode:
+    log(f"surface mode: {'faces' if faces_mode else ('body' if body_mode else 'medial')}")
+    if a.faces_labels and not (faces_mode or body_mode):
         log("WARNING --faces-labels ignored: the prediction store has no sdf_in/sdf_out channels")
 
     # common region: the prediction store, clipped to the config region (and to 4-voxel alignment)
@@ -1370,7 +1618,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     brick = tuple(int(v) for v in str(a.brick).split(","))
     vox, surf = voxel_pass(pred, fine, coarse, stores["ink"], lo, hi, clip, cfg.budget, brick,
-                           fiber_t=stores["fiber"], wf_store=flab)
+                           fiber_t=stores["fiber"], wf_store=flab, flab=flab)
 
     # --- the student medial surface: the zero set of sdf in medial mode, equidistance in faces mode ---
     faces_metrics: dict[str, Any] | None = None
@@ -1424,7 +1672,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     }
     if faces_mode and recto is not None:
         metrics["surface_inface_vs_recto"] = metrics_inface
-    if flab is not None:
+    if flab is not None and faces_mode:
         log("faces label metrics")
         metrics["faces"] = faces_pass(pred, flab, lo, hi, clip, cfg.budget, brick)
     if a.rectoverso:
@@ -1433,14 +1681,23 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             raise FileNotFoundError(f"no rectoverso store at {a.rectoverso}")
         if not rvs.has("rectoverso"):
             raise ValueError(f"{a.rectoverso} has no 'rectoverso' channel (has {rvs.channels})")
-        if not faces_mode:
-            log("WARNING --rectoverso ignored: the prediction store has no sdf_in/sdf_out channels")
+        if not (faces_mode or body_mode):
+            log("WARNING --rectoverso ignored: the prediction store has no "
+                "sdf_in/sdf_out or sdf_body channels")
         else:
-            log(f"upstream (teacher-independent) face metrics vs {rvs.path}")
-            metrics["upstream_faces"] = upstream_faces_pass(pred, rvs, lo, hi, cfg.budget, brick)
+            if faces_mode:
+                log(f"upstream (teacher-independent) face metrics vs {rvs.path}")
+                metrics["upstream_faces"] = upstream_faces_pass(pred, rvs, lo, hi, cfg.budget, brick)
+            # the unordered score runs for BOTH store kinds: it is what makes a faces baseline
+            # and a body run directly comparable
+            log(f"upstream (teacher-independent) unordered body metrics vs {rvs.path}")
+            metrics["upstream_body"] = upstream_body_pass(pred, rvs, lo, hi, cfg.budget, brick)
             log("upstream (teacher-independent) topology metrics")
-            metrics["upstream_topology"] = upstream_topology_pass(pred, rvs, lo, hi, cfg.budget, brick)
+            metrics["upstream_topology"] = upstream_topology_pass(pred, rvs, lo, hi, cfg.budget,
+                                                                  brick, clip=clip)
     # --- teacher-independent fibre numbers: the human hz/vt bands ---
+    axis_spec = resolve_axis(cfg, a.axis)
+    metrics["axis"] = str(axis_spec) if axis_spec is not None else None
     band_store, band_ch = None, None
     if fine is not None and fine.has("hzvt_class"):
         band_store, band_ch = fine, "hzvt_class"
@@ -1451,10 +1708,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     if band_store is not None and pred.has("fiber_vt") and pred.has("fiber_hz"):
         log(f"upstream (teacher-independent) fibre metrics vs {band_store.path}:{band_ch}")
         metrics.setdefault("fiber", {})["upstream"] = fiber_upstream_pass(
-            pred, band_store, band_ch, lo, hi, clip, cfg.budget, brick)
+            pred, band_store, band_ch, lo, hi, clip, cfg.budget, brick, axis=axis_spec)
     if not a.no_gallery:
         metrics["gallery"] = gallery(ed, cfg, pred, stores, lo, hi, clip, surf, a.slices,
-                                     faces_labels=flab, medial=smed if faces_mode else None)
+                                     faces_labels=flab if faces_mode else None,
+                                     medial=smed if faces_mode else None)
     metrics["seconds"] = time.perf_counter() - t0
     with open(os.path.join(ed, "metrics.json"), "w") as fh:
         json.dump(metrics, fh, indent=2, default=float)
