@@ -58,6 +58,8 @@ __all__ = [
     "pred_channels",
     "n_head_ch",
     "N_HEAD_CH",
+    "BODY_PRED_CHANNELS",
+    "N_BODY_HEAD_CH",
     "INFER_DEFAULTS",
     "EXPORT_DEFAULTS",
     "activate_heads",
@@ -92,6 +94,12 @@ N_HEAD_CH = 11  # surface 2 + ink 1 + winding 8
 FACE_PRED_CHANNELS = ["sdf_in", "sdf_out", "valid", "ink", "sin", "cos", "density", "nx", "ny", "nz", "conf", "spare",
                       "surface_in1", "surface_out1", "thickness"]
 N_FACE_HEAD_CH = 12
+# orientation-free body mode (extra.train.surface_mode = "body"): the medial head layout
+# (surface 2 + ink 1 + winding 8) with the single SDF being tsm.data.body_sdf, plus the one
+# derived thin surface of its zero set.  No thickness channel: the body SDF does not name sides.
+BODY_PRED_CHANNELS = ["sdf_body", "valid", "ink", "sin", "cos", "density", "nx", "ny", "nz", "conf", "spare",
+                      "surface_body1"]
+N_BODY_HEAD_CH = 11
 # optional fibre head (2 logits): appended after the winding channels, before the derived
 # surface1 / thickness channels, so an old store is a prefix of a new one only up to `spare`.
 FIBER_PRED_CHANNELS = ["fiber_vt", "fiber_hz"]
@@ -104,7 +112,8 @@ N_FIBER_DIR_HEAD_CH = 4
 
 
 def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> list[str]:
-    base = list(FACE_PRED_CHANNELS) if surface_mode == "faces" else list(PRED_CHANNELS)
+    base = {"faces": FACE_PRED_CHANNELS, "body": BODY_PRED_CHANNELS}.get(surface_mode, PRED_CHANNELS)
+    base = list(base)
     if not fiber:
         return base
     cut = base.index("spare") + 1  # the derived (non-head) channels follow `spare`
@@ -115,7 +124,7 @@ def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode:
 
 
 def n_head_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> int:
-    n = N_FACE_HEAD_CH if surface_mode == "faces" else N_HEAD_CH
+    n = {"faces": N_FACE_HEAD_CH, "body": N_BODY_HEAD_CH}.get(surface_mode, N_HEAD_CH)
     if not fiber:
         return n
     return n + (N_FIBER_DIR_HEAD_CH if fiber_mode == "direction" else N_FIBER_HEAD_CH)
@@ -139,7 +148,7 @@ INFER_DEFAULTS: dict[str, Any] = {
     "trt_precision": "fp16",  # fp16 (bf16 has no TensorRT 11 tactic for 3D ConvTranspose)
     "trt_workspace_gb": 6.0,
     "batch": 1,
-    "surface_mode": None,  # None = from the checkpoint config ("medial" | "faces")
+    "surface_mode": None,  # None = from the checkpoint config ("medial" | "faces" | "body")
     "tta": "none",  # "none" | "flip8" | "flip8_rot4" (student-side, per-channel inverse rules; bool: False/True = none/flip8)
     "clip": CLIP,
     "empty_max": 0,
@@ -167,7 +176,7 @@ EXPORT_DEFAULTS: dict[str, Any] = {
         "cos_scaledown": 2,  # villa defaults: cos (+ pred_dt) at input/2, grad_mag/nx/ny at input/4
         "scaledown": 4,
         "base_shape_zyx": None,  # default: pred.summary.json volume_shape_zyx, else region end
-        "pred_dt_channel": None,  # default: "sdf_in" in the two-face mode, else "sdf"
+        "pred_dt_channel": None,  # default: "sdf_in" (two-face) / "sdf_body" (body), else "sdf"
         "sheet_half_vox": 2.0,  # |sdf| <= this (fine voxels) counts as "inside" the sheet for pred_dt
         "min_cover": 0.5,
         "ome_chunk": 32,
@@ -186,7 +195,7 @@ EXPORT_DEFAULTS: dict[str, Any] = {
 
 
 def _checkpoint_surface_mode(ckpt: str, override: Any = None) -> str:
-    """Surface mode of a student checkpoint ("medial" | "faces"); ``override`` wins when set."""
+    """Surface mode of a student checkpoint ("medial" | "faces" | "body"); ``override`` wins when set."""
     if override:
         return str(override)
     if not os.path.exists(ckpt):
@@ -251,7 +260,7 @@ def activate_heads(out: dict[str, torch.Tensor], surface_mode: str = "medial",
     [sdf_in, sdf_out, valid, ...]): sdf raw (voxels), probabilities via sigmoid, (sin, cos) and
     the normal renormalised, density relu (training used the raw head output; relu keeps it >= 0)."""
     s, i, w = out["surface"].float(), out["ink"].float(), out["winding"].float()
-    ns = 2 if surface_mode == "faces" else 1
+    ns = 2 if surface_mode == "faces" else 1  # "body" is one channel, like "medial"
     sc = F.normalize(w[:, 0:2], dim=1, eps=1e-6)
     n = F.normalize(w[:, 3:6], dim=1, eps=1e-6)
     parts = [s[:, 0:ns], torch.sigmoid(s[:, ns:ns + 1]), torch.sigmoid(i[:, 0:1]), sc, torch.relu(w[:, 2:3]), n,
@@ -291,7 +300,7 @@ def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
 def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHANNELS) -> dict[str, np.ndarray]:
     """(C, ...) pred.zarr bytes -> float32 fields + ``data`` (sdf byte != 0) and ``surface1`` (bool)."""
     ch = {name: u8[k] for k, name in enumerate(channels)}
-    sdf_names = [k for k in ("sdf", "sdf_in", "sdf_out") if k in ch]
+    sdf_names = [k for k in ("sdf", "sdf_in", "sdf_out", "sdf_body") if k in ch]
     out: dict[str, np.ndarray] = {"data": ch[sdf_names[0]] != 0}
     for k in sdf_names:
         out[k] = decode_sdf(ch[k], clip) * out["data"]
@@ -306,7 +315,7 @@ def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHAN
     for k in ("sin", "cos", "nx", "ny", "nz"):
         out[k] = decode_signed(ch[k])
     out["density"] = decode_density(ch["density"])
-    for k in ("surface1", "surface_in1", "surface_out1"):
+    for k in ("surface1", "surface_in1", "surface_out1", "surface_body1"):
         if k in ch:
             out[k] = ch[k] > 127
     if "thickness" in ch:
@@ -649,7 +658,7 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
     for need in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength", "fiber_vt", "fiber_hz"):
         if need not in ch:
             raise ValueError(f"{pred_path} has no {need!r} channel (channels={ch})")
-    sdf_name = "sdf_in" if "sdf_in" in ch else "sdf"
+    sdf_name = next(k for k in ("sdf_in", "sdf_body", "sdf") if k in ch)
     idx = {n: ch.index(n) for n in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength",
                                     "fiber_vt", "fiber_hz", sdf_name)}
     shape = tuple(int(s) for s in arr.shape[1:])
@@ -696,12 +705,18 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
 
     Medial mode: ``surface1`` from ``sdf``.  Two-face mode: ``surface_in1`` from ``sdf_in``,
     ``surface_out1`` from ``sdf_out`` and ``thickness`` = round(clip(sdf_in - sdf_out, 0, 255))
-    (the gap between the two zero sets, in voxels, 0 outside the sheet / no data)."""
+    (the gap between the two zero sets, in voxels, 0 outside the sheet / no data).  Body mode:
+    ``surface_body1`` from ``sdf_body`` and no thickness pass (the body SDF names no sides)."""
     log = log or (lambda m: print(m, flush=True))
     arr = zarr.open_array(store=pred_path, mode="r+")
     ch = list(arr.attrs["channels"])
     faces = "sdf_in" in ch
-    pairs = [("surface_in1", "sdf_in"), ("surface_out1", "sdf_out")] if faces else [("surface1", "sdf")]
+    if faces:
+        pairs = [("surface_in1", "sdf_in"), ("surface_out1", "sdf_out")]
+    elif "sdf_body" in ch:
+        pairs = [("surface_body1", "sdf_body")]
+    else:
+        pairs = [("surface1", "sdf")]
     ival = ch.index("valid")
     shape = tuple(int(s) for s in arr.shape[1:])
     t0 = time.perf_counter()
@@ -771,6 +786,10 @@ def _preview_slices(pred_path: str, clip: float, max_dim: int = 2048) -> dict[st
         rgb[g("surface_in1") > 127] = (255, 0, 0)
         rgb[g("surface_out1") > 127] = (0, 0, 255)
         return {"sdf_in": g("sdf_in"), "sdf_out": g("sdf_out"), "faces": rgb, "thickness": g("thickness"), **common}
+    if "sdf_body" in ch:
+        rgb = np.repeat(g("sdf_body")[..., None], 3, axis=-1).copy()
+        rgb[g("surface_body1") > 127] = (255, 0, 0)
+        return {"sdf_body": rgb, **common}
     sdf_rgb = np.repeat(g("sdf")[..., None], 3, axis=-1).copy()
     sdf_rgb[g("surface1") > 127] = (255, 0, 0)
     return {"sdf": sdf_rgb, **common}
@@ -936,7 +955,7 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
             "valid|ink|conf|spare|fiber_vt|fiber_hz|fiber_strength": "sigmoid * 255",
             "sin|cos|nx|ny|nz|fiber_dz|fiber_dy|fiber_dx": "127.5 + 127.5 v",
             "density": "relu(v) * 1000, wraps per voxel at voxel_um",
-            "surface1|surface_in1|surface_out1": "255 on the 1-voxel surface",
+            "surface1|surface_in1|surface_out1|surface_body1": "255 on the 1-voxel surface",
             "thickness": "round(clip(sdf_in - sdf_out, 0, 255)) voxels (two-face mode)",
         },
         "peak_rss_mb": peak_rss_mb(),
@@ -1171,7 +1190,8 @@ def export_lasagna(
     wraps per level-``level_shift`` voxel (``grad_mag_factor = 1 / 2**level_shift`` converts to base
     voxels, as villa's ``fit_data.load_3d`` does: ``grad_mag / (1000 / grad_mag_factor)``);
     nx, ny = ``hemisphere_nxny`` (nz >= 0, (u8 - 128) / 127); pred_dt = ``encode_pred_dt`` of
-    ``pred_dt_channel`` (default ``sdf_in`` for a two-face prediction store, else ``sdf``)
+    ``pred_dt_channel`` (default ``sdf_in`` for a two-face store, ``sdf_body`` for a body store,
+    else ``sdf``)
     (fine voxels) mean-pooled to the cos level like villa's INTER_AREA.  No data (cover <
     ``min_cover``): cos/grad_mag/pred_dt 0, nx/ny 128.  Pooling is mask-aware over
     valid > 0.5 voxels; sin/cos and normals are renormalised after averaging.
@@ -1188,7 +1208,7 @@ def export_lasagna(
     arr, attrs = _open_pred(pred_store)
     clip = _pred_clip(pred_store, clip)
     ch = list(attrs["channels"])
-    dt_ch = str(pred_dt_channel or ("sdf_in" if "sdf_in" in ch else "sdf"))
+    dt_ch = str(pred_dt_channel or next(k for k in ("sdf_in", "sdf_body", "sdf") if k in ch))
     if dt_ch not in ch:
         raise ValueError(f"pred_dt_channel {dt_ch!r} not in the prediction store ({ch})")
     origin, shape = attrs["origin_zyx"], attrs["shape_zyx"]

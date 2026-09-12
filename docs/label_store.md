@@ -537,6 +537,25 @@ Choices made where the tables above are silent; the tables are unchanged.
   simply carries 2 channels through the identical per-channel rule.  `evaluate` reports the medial
   metrics per face (`surface/in_*`, `surface/out_*`) plus `surface/thickness_mae`
   (`sdf_in - sdf_out` between the faces).
+- **Body mode (`extra.train.surface_mode = "body"`, 2026-09-12).**  The orientation-free target:
+  the same store as `"faces"` (origins and `surface_valid` from `faces_valid`, `faces_weight` still
+  applies), but `surface_sdf` is the single channel `data.body_sdf(sdf_in, sdf_out) =
+  min(sdf_in, -sdf_out)` -- positive inside the papyrus, `0` on both faces *and* on a labelled
+  contact plane (touching sheets stay separate `> 0` components), negative outside.  The head is the
+  medial one, `[sdf_body, valid logit]`, so the export / TRT layout is unchanged.  Loss
+  `train.body_loss` = the medial terms (`surface/sdf_l1`, `surface/band_dice`, `surface/valid_bce`),
+  bit-identical to `surface_loss` when no `surface_aux` weight is set; with `surface_aux` it adds the
+  zero-set terms named for the body (`surface/shell_body`, `crest_body`, `far_body`) and the
+  single-target form of `gap` / `cldice`.  Augmentation is the unchanged scalar-SDF path (isotropic
+  scale × `det(S)^(1/3)`, saturation → `valid 2`); `min()` and resampling commute exactly for the
+  cube rotations / flips and to sub-voxel accuracy otherwise.  The direction fibre targets use
+  `fiber.sheet_normal(prefer_fallback=True)` here (the gradient of a body SDF is degenerate on the
+  medial ridge).  `evaluate` uses the single-face keys and adds `surface/body_dice`,
+  `surface/body_iou`, `surface/body_vol_ratio` and `surface/body_n_components_ratio` (26-connected,
+  ≥ 32 voxels, per-crop median); there is no `thickness_mae`.  Prediction store:
+  `tsm.infer.pred_channels("body")` = `sdf_body, valid, ink, sin, cos, density, nx, ny, nz, conf,
+  spare, surface_body1` (fibre channels spliced after `spare` as usual), with no thickness pass.
+  Configs: `configs/body30k{,_bgf,_bgf_aux}.json`.
 - **Auxiliary surface terms (`extra.train.surface_aux`, faces mode, 2026-09-07).**  Three optional
   terms on the *zero set* rather than on the SDF value, all with weight `0` by default -- with the
   defaults the surface loss is byte-identical to the one above and nothing is even computed

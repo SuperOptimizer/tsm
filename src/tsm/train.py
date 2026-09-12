@@ -13,7 +13,12 @@ the coarse store by the dataset.  Losses (all masked by the target valid masks):
            ``surface/gap`` / ``surface/cldice``.
            ``extra.train.surface_mode = "faces"`` instead trains a 3-channel head
            [sdf_in, sdf_out, valid] against the two-face labels (``faces_loss``):
-           the same L1 + band Dice per face plus the one valid BCE.  Default
+           the same L1 + band Dice per face plus the one valid BCE.
+           ``extra.train.surface_mode = "body"`` trains the *orientation-free* 2-channel head
+           [sdf_body, valid] against ``data.body_sdf`` = min(sdf_in, -sdf_out) (``body_loss``):
+           the medial terms on the single channel, plus the same optional aux terms with the
+           body as its own "face" (``shell_body`` / ``crest_body`` / ``far_body``) and the
+           single-target form of ``gap`` / ``cldice``.  Default
            "medial" (the single SDF to the recto medial surface) is unchanged.
   ink:     BCE (``pos_weight`` from ``extra.train.ink_pos_weight``: "auto" = this batch's
            sum(1-p)/sum(p) over valid==1, clamped to [1, 50]; a number; or null/0 = off)
@@ -166,8 +171,10 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     #   {"name", "fine_store", "coarse_store", "axis", "voxel_um", "weight", "volume", "region"}
     "stores": None,
     "holdout_stores": None,  # [name, ...]: those stores train on nothing and are evaluated whole
-    "surface_mode": "medial",  # "medial" (single SDF to the recto medial surface) | "faces" (two-face)
-    # optional auxiliary surface terms (faces mode); null / all-zero weights = unchanged loss
+    # "medial" (single SDF to the recto medial surface) | "faces" (two-face) |
+    # "body" (orientation-free min(sdf_in, -sdf_out), one channel, tsm.data.body_sdf)
+    "surface_mode": "medial",
+    # optional auxiliary surface terms (faces / body modes); null / all-zero weights = unchanged loss
     "surface_aux": None,   # see SURFACE_AUX_DEFAULTS
     # train-time umbilicus core mask: voxels within this in-plane radius (fine voxels) of the
     # scroll axis get surface_valid = 2 (ignore) and winding_valid = 0 (see data.CropDataset).
@@ -278,8 +285,11 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
     opts["balance_freeze"] = bool(opts["balance_freeze"])
     if int(opts["grad_log_every"]) < 0:
         raise ValueError("extra.train.grad_log_every must be >= 0")
-    if opts["surface_mode"] not in ("medial", "faces"):
-        raise ValueError(f"extra.train.surface_mode must be 'medial' or 'faces', got {opts['surface_mode']!r}")
+    from tsm.data import SURFACE_MODES
+
+    if opts["surface_mode"] not in SURFACE_MODES:
+        raise ValueError(f"extra.train.surface_mode must be one of {SURFACE_MODES}, "
+                         f"got {opts['surface_mode']!r}")
     opts["surface_aux"] = surface_aux_opts(opts.get("surface_aux"), opts["surface_mode"])
     if float(opts["core_radius_vox"]) < 0:
         raise ValueError("extra.train.core_radius_vox must be >= 0")
@@ -468,8 +478,8 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
 
     Every weight defaults to 0; with all three at 0 the surface loss is byte-identical to the
     historical one, so this is safe to leave in a config.  The terms only exist in
-    ``surface_mode="faces"`` -- asking for them in ``"medial"`` mode is an error rather than a
-    silent no-op."""
+    ``surface_mode="faces"`` and ``"body"`` -- asking for them in ``"medial"`` mode is an error
+    rather than a silent no-op."""
     if raw is None or raw is False:
         return dict(SURFACE_AUX_DEFAULTS)
     if not isinstance(raw, dict):
@@ -491,8 +501,8 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
         out[k] = int(r)
     if out["gap"] > 0 and out["gap_tau"] <= 0:
         raise ValueError("extra.train.surface_aux.gap_tau must be > 0 when gap > 0")
-    if surface_aux_active(out) and surface_mode != "faces":
-        raise ValueError("extra.train.surface_aux needs extra.train.surface_mode='faces'")
+    if surface_aux_active(out) and surface_mode not in ("faces", "body"):
+        raise ValueError("extra.train.surface_aux needs extra.train.surface_mode='faces' or 'body'")
     if out["shell"] > 0 and out["shell_radius"] < out["shell_margin"]:
         print(f"[tsm] WARNING surface_aux.shell_radius {out['shell_radius']} < shell_margin "
               f"{out['shell_margin']}: the shell is the *cubic* dilation of the label zero set, so "
@@ -642,13 +652,18 @@ def _close(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return _erode(_dilate(mask, radius), radius)
 
 
-def body_mask(t_in: torch.Tensor, t_out: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-    """The label sheet *body* (papyrus material) as a 0/1 map: ``(sdf_in > 0) & (sdf_out < 0)``.
+def body_mask(t_in: torch.Tensor, t_out: torch.Tensor | None = None,
+              m: torch.Tensor | float = 1.0) -> torch.Tensor:
+    """The label sheet *body* (papyrus material) as a 0/1 map.
 
-    Same definition as the ``inside`` mask of :func:`evaluate`'s thickness metric: the body is the
-    slab between the two faces, and its thickness is ``sdf_in - sdf_out``.  ``m`` restricts it to
+    Two-face target (``t_out`` given): ``(sdf_in > 0) & (sdf_out < 0)`` -- the same definition as
+    the ``inside`` mask of :func:`evaluate`'s thickness metric: the body is the slab between the
+    two faces, and its thickness is ``sdf_in - sdf_out``.  Body target (``t_out is None``,
+    ``surface_mode="body"``): the single channel already *is* ``min(sdf_in, -sdf_out)``
+    (:func:`tsm.data.body_sdf`), so the body is simply ``sdf_body > 0``.  ``m`` restricts it to
     the supervised voxels."""
-    return ((t_in > 0) & (t_out < 0)).float() * m
+    inside = (t_in > 0) if t_out is None else ((t_in > 0) & (t_out < 0))
+    return inside.float() * m
 
 
 def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int) -> torch.Tensor:
@@ -656,12 +671,15 @@ def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int) -> torc
     return _close(body_t, radius) * (1.0 - body_t) * m1
 
 
-def soft_body(p_in: torch.Tensor, p_out: torch.Tensor, tau: float) -> torch.Tensor:
-    """Differentiable body probability ``sigmoid(sdf_in / tau) * sigmoid(-sdf_out / tau)``.
+def soft_body(p_in: torch.Tensor, p_out: torch.Tensor | None = None, tau: float = 2.0) -> torch.Tensor:
+    """Differentiable body probability, the soft counterpart of :func:`body_mask`.
 
-    The product of the two half-space indicators the hard body mask ANDs; ``tau`` (voxels, the
-    same scale as :data:`BAND_TAU`) is how sharply the faces cut."""
-    return torch.sigmoid(p_in / tau) * torch.sigmoid(-p_out / tau)
+    Two faces: ``sigmoid(sdf_in / tau) * sigmoid(-sdf_out / tau)`` -- the product of the two
+    half-space indicators the hard body mask ANDs.  One body channel (``p_out is None``):
+    ``sigmoid(sdf_body / tau)``.  ``tau`` (voxels, the same scale as :data:`BAND_TAU`) is how
+    sharply the faces cut."""
+    p = torch.sigmoid(p_in / tau)
+    return p if p_out is None else p * torch.sigmoid(-p_out / tau)
 
 
 def soft_skel(x: torch.Tensor, iters: int) -> torch.Tensor:
@@ -688,7 +706,8 @@ def soft_skel(x: torch.Tensor, iters: int) -> torch.Tensor:
     return skel
 
 
-def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor,
+def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor | None, t_in: torch.Tensor,
+                       t_out: torch.Tensor | None,
                        mv: torch.Tensor, m1: torch.Tensor, aux: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     """Optional *body* terms of ``extra.train.surface_aux`` (``gap``, ``cldice``), both off by default.
 
@@ -730,6 +749,11 @@ def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor, t_in: torch.Tens
     ``tprec``; a missing or broken sheet leaves label skeleton uncovered and drops ``tsens``.  The
     sums are over the whole batch (masked); a batch whose label body is empty everywhere returns a
     constant 0 rather than the degenerate ``1 - 0/0``.
+
+    In ``surface_mode="body"`` the primary target is already the body SDF
+    (:func:`tsm.data.body_sdf`): call this with ``p_out = t_out = None`` and both the label body
+    (``sdf_body > 0``) and the soft predicted body (``sigmoid(sdf_body / tau)``) come from the
+    single channel -- every term below is otherwise identical.
 
     Returned values are already multiplied by their weight, so the caller just sums them."""
     out: dict[str, torch.Tensor] = {}
@@ -805,6 +829,31 @@ def faces_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
                                       sdf[:, 0:1], sdf[:, 1:2], mv, m1, aux or {}))
     out["valid_bce"] = masked_mean(
         F.binary_cross_entropy_with_logits(pred[:, 2:3].float(), (valid == 1).float(), reduction="none"), m_not2)
+    return out
+
+
+def body_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
+              weight: torch.Tensor | None = None,
+              aux: Mapping[str, Any] | None = None) -> dict[str, torch.Tensor]:
+    """Orientation-free surface head (``surface_mode="body"``): pred = [sdf_body, valid logit],
+    target = the single :func:`tsm.data.body_sdf` channel ``min(sdf_in, -sdf_out)``.
+
+    The primary terms are exactly :func:`surface_loss` (gaussian-weighted L1 + band Dice on the
+    zero set + the valid BCE on ``valid != 2``), so with no ``aux`` -- or all its weights 0 --
+    the returned dict is bit-identical to the medial one.  ``aux``
+    (``extra.train.surface_aux``) adds the zero-set terms of :func:`surface_aux_terms` with the
+    body as its own "face" (``shell_body``, ``crest_body``, ``far_body``) and the single-target
+    form of the body topology terms (``gap``, ``cldice``, :func:`surface_body_terms`)."""
+    if pred.shape[1] < 2 or sdf.shape[1] != 1:
+        raise ValueError(f"body mode needs a 2-channel surface head and a 1-channel target, got "
+                         f"{tuple(pred.shape)} / {tuple(sdf.shape)}")
+    out = surface_loss(pred, sdf, valid, weight)
+    if surface_aux_active(aux):
+        mv = (valid == 1).float()
+        m1 = _weighted(mv, weight)
+        p_sdf = pred[:, 0:1].float()
+        out.update(surface_aux_terms(p_sdf, sdf, mv, m1, aux or {}, "body"))
+        out.update(surface_body_terms(p_sdf, None, sdf, None, mv, m1, aux or {}))
     return out
 
 
@@ -983,6 +1032,9 @@ def compute_losses(
             if surface_mode == "faces":
                 terms["surface"] = faces_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
                                               t.get("surface_weight"), aux=surface_aux)
+            elif surface_mode == "body":
+                terms["surface"] = body_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
+                                             t.get("surface_weight"), aux=surface_aux)
             else:
                 terms["surface"] = surface_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
                                                 t.get("surface_weight"))
@@ -2152,6 +2204,23 @@ def _dist_stats(d: np.ndarray, prefix: str) -> dict[str, float]:
     return {f"{prefix}_median": float(np.median(d)), f"{prefix}_p90": float(np.percentile(d, 90)), f"{prefix}_frac_gt3": float((d > 3.0).mean())}
 
 
+#: minimum size (voxels) of a body component counted by ``surface/body_n_components_ratio``
+BODY_MIN_COMPONENT = 32
+
+
+def _n_components(mask: np.ndarray, min_size: int = BODY_MIN_COMPONENT) -> int:
+    """Number of 26-connected components of a boolean mask with at least ``min_size`` voxels."""
+    from scipy import ndimage as ndi
+
+    if not mask.any():
+        return 0
+    lab, n = ndi.label(mask, structure=np.ones((3, 3, 3), np.uint8))
+    if n == 0:
+        return 0
+    sizes = np.bincount(lab.ravel())[1:]
+    return int((sizes >= int(min_size)).sum())
+
+
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
@@ -2178,7 +2247,15 @@ def evaluate(
     class probability -- vs teacher probability > 0.5); direction mode also reports the axial
     angular error ``fiber/angle_deg`` (mean + median, on valid voxels whose target strength is
     > 0.5) and, where the human ``hzvt_class`` bands cover a voxel, the teacher-independent
-    ``fiber/band_angle_deg`` and ``fiber/band_class_acc``.  Deterministic
+    ``fiber/band_angle_deg`` and ``fiber/band_class_acc``; both modes also report the class
+    **exclusivity** ``fiber/overlap_frac`` = n(vt > .5 & hz > .5) / n(vt > .5 | hz > .5) and
+    ``fiber/firing_frac`` = n(vt > .5 | hz > .5) / n(fiber_valid == 1), on the (derived) class
+    probabilities.  ``surface_mode="body"`` goes through the single-face branch (sdf MAE, zc
+    Dice, distances, missed / spurious, valid AUPRC) and adds ``surface/body_dice``,
+    ``surface/body_iou``, ``surface/body_vol_ratio`` (predicted / label body voxels) and
+    ``surface/body_n_components_ratio`` (26-connected components of at least 32 voxels, the
+    per-crop median of pred / label counts); there is no ``thickness_mae`` in body mode.
+    Deterministic
     (fixed crop order, no augmentation, eval mode); AUPRC/AUROC use a seeded reservoir of at most
     ``sample_cap`` voxels drawn with equal probability from the whole pooled voxel stream (the
     sample, and hence the metric, does not depend on ``batch``)."""
@@ -2201,7 +2278,11 @@ def evaluate(
     band_ang: list[np.ndarray] = []
     band_hit = [0.0, 0.0]  # correct / total human-band voxels
     faces = surface_mode == "faces"
+    body = surface_mode == "body"
     face_names = ("in", "out") if faces else ("",)
+    body_sums = [0.0, 0.0, 0.0]   # |pred & label|, |pred|, |label| body voxels (valid == 1)
+    body_comp: list[float] = []   # per-crop ratio of 26-connected component counts
+    fib_excl = [0.0, 0.0, 0.0]    # n(both), n(either), n(fiber_valid == 1)
     d_p2t: dict[str, list[np.ndarray]] = {f: [] for f in face_names}
     d_t2p: dict[str, list[np.ndarray]] = {f: [] for f in face_names}
     missed = {f: [0, 0] for f in face_names}  # crops with (label surface, no prediction) / (prediction, no label)
@@ -2245,6 +2326,17 @@ def evaluate(
                 d_t2p[fname].append(c)
                 missed[fname][0] += int(tn.any() and not pn.any())
                 missed[fname][1] += int(pn.any() and not tn.any())
+        if body:
+            # the orientation-free body: sdf_body > 0 is "this voxel is sheet material"
+            p_b = (out["surface"][:, 0:1] > 0) & m1
+            t_b = (b["surface_sdf"][:, 0:1] > 0) & m1
+            body_sums[0] += float((p_b & t_b).sum())
+            body_sums[1] += float(p_b.sum())
+            body_sums[2] += float(t_b.sum())
+            for bi in range(p_b.shape[0]):
+                np_, nt_ = (_n_components(x[bi, 0].cpu().numpy()) for x in (p_b, t_b))
+                if nt_ > 0:
+                    body_comp.append(np_ / nt_)
         if faces:  # predicted vs label sheet thickness (sdf_in - sdf_out between the faces)
             th_p = out["surface"][:, 0:1] - out["surface"][:, 1:2]
             th_t = b["surface_sdf"][:, 0:1] - b["surface_sdf"][:, 1:2]
@@ -2265,7 +2357,10 @@ def evaluate(
                 # the in-plane basis at every voxel, from the LABEL geometry (grad sdf_in, the
                 # winding normal where that is not a unit vector) -- the same rule the dataset
                 # used to build the target, so the derived classes are comparable to the teacher
-                nrm, _ = sheet_normal(b["surface_sdf"][:, 0:1], b["winding"][:, 3:6].flip(1))
+                # ``prefer_fallback`` in body mode: grad of a body SDF is degenerate on the
+                # medial ridge, so the winding normal leads there (tsm.fiber.sheet_normal)
+                nrm, _ = sheet_normal(b["surface_sdf"][:, 0:1], b["winding"][:, 3:6].flip(1),
+                                      prefer_fallback=body)
                 tv, th, ok = fiber_basis(nrm, b.get("axis_dir"))
                 dp = F.normalize(fb_out[:, 0:3].float(), dim=1, eps=EPS)
                 sp = torch.sigmoid(fb_out[:, 3:4].float())
@@ -2295,6 +2390,13 @@ def evaluate(
                     if bool(mb.any()):
                         band_hit[0] += float(((logits[0] > logits[1]) == (band == 2))[mb].sum())
                         band_hit[1] += float(mb.sum())
+            # class exclusivity, on the probabilities both modes can produce: the student's
+            # two channels should almost never fire together (the labels never do)
+            q_vt, q_hz = ((pv, ph) if fdir else (torch.sigmoid(logits[0]), torch.sigmoid(logits[1])))
+            hot_v, hot_h = (q_vt > 0.5) & mf, (q_hz > 0.5) & mf
+            fib_excl[0] += float((hot_v & hot_h).sum())
+            fib_excl[1] += float((hot_v | hot_h).sum())
+            fib_excl[2] += float(mf.sum())
             if "fiber_prob" in b:
                 for i, name in enumerate(("vt", "hz")):
                     samp[f"fiber_{name}"].add(logits[i][mf], (b["fiber_prob"][:, i:i + 1] > 0.5)[mf], n)
@@ -2330,11 +2432,23 @@ def evaluate(
         res.update(_dist_stats(np.concatenate([a, c]), f"{pre}surf_sym"))
         res[f"{pre}missed_surfaces"] = float(missed[fname][0])    # label surface, empty prediction
         res[f"{pre}spurious_surfaces"] = float(missed[fname][1])  # prediction, empty label surface
+    if body:
+        inter, npred, nlab = body_sums
+        res["surface/body_dice"] = 2.0 * inter / (npred + nlab) if (npred + nlab) > 0 else float("nan")
+        union = npred + nlab - inter
+        res["surface/body_iou"] = inter / union if union > 0 else float("nan")
+        res["surface/body_vol_ratio"] = npred / nlab if nlab > 0 else float("nan")
+        res["surface/body_pred_voxels"] = npred
+        res["surface/body_label_voxels"] = nlab
+        res["surface/body_n_components_ratio"] = float(np.median(body_comp)) if body_comp else float("nan")
     res["surface/valid_auprc"] = average_precision(*samp["valid"].arrays())
     res["ink/ink_auprc"] = average_precision(*samp["ink"].arrays())
     for name in ("vt", "hz"):
         if samp[f"fiber_{name}"].n:
             res[f"fiber/{name}_auprc"] = average_precision(*samp[f"fiber_{name}"].arrays())
+    if fib_excl[2] > 0:
+        res["fiber/overlap_frac"] = fib_excl[0] / fib_excl[1] if fib_excl[1] > 0 else 0.0
+        res["fiber/firing_frac"] = fib_excl[1] / fib_excl[2]
     if fiber_ang:
         a = np.concatenate(fiber_ang)
         res["fiber/angle_deg"] = float(a.mean())

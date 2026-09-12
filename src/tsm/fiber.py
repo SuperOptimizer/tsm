@@ -216,6 +216,7 @@ def derive_direction_targets(
     band: np.ndarray | None = None,
     band_weight: float = 5.0,
     axis: Any = None,
+    prefer_fallback: bool = False,
 ) -> dict[str, np.ndarray]:
     """Dataset-side derivation (numpy, one crop) of the direction targets.
 
@@ -223,10 +224,14 @@ def derive_direction_targets(
     the teacher probabilities, the decoded ``sdf_in`` (or ``sdf`` in the medial mode), the
     ``fiber_valid`` mask (0/1) and, optionally, the human ``hzvt_class`` band.
     Returns ``fiber_dir`` (3), ``fiber_str`` (1), ``fiber_valid`` (1) and ``fiber_weight`` (1).
+
+    ``prefer_fallback`` (see :func:`sheet_normal`) makes the winding normal the *primary*
+    sheet normal, with ``grad sdf`` only filling its gaps: what ``surface_mode="body"`` needs,
+    since the gradient of a body SDF is degenerate on the medial ridge.
     """
     t = lambda a: torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))  # noqa: E731
     fb = None if winding_normal_zyx is None else t(winding_normal_zyx)
-    n, _ = sheet_normal(t(sdf), fb)
+    n, _ = sheet_normal(t(sdf), fb, prefer_fallback=bool(prefer_fallback))
     tv, th, ok = fiber_basis(n, axis)
     d, s = direction_from_class(t(p_vt), t(p_hz), tv, th)
     v = t(valid)

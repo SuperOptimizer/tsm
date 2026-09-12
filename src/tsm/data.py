@@ -49,10 +49,12 @@ is a pseudovector and would leak ``det(L)`` under flip augmentation.
 
 Surface mode (``surface_mode``, ``extra.train.surface_mode``): "medial" (default,
 unchanged: ``surface_sdf`` = the single SDF to the recto medial surface, mask
-``sdf_valid``) or "faces" (``surface_sdf`` = the 2-channel [sdf_in, sdf_out] of
-the two-face labels, mask ``faces_valid``).  Both channels obey exactly the same
-augmentation rules as the single sdf: "in" and "out" are defined by the physical
-outward direction, which moves with the geometry, so no transform ever swaps them.
+``sdf_valid``), "faces" (``surface_sdf`` = the 2-channel [sdf_in, sdf_out] of
+the two-face labels, mask ``faces_valid``) or "body" (orientation-free: ``surface_sdf``
+= the single channel ``min(sdf_in, -sdf_out)`` of :func:`body_sdf`, mask ``faces_valid``).
+The two face channels obey exactly the same augmentation rules as the single sdf: "in" and
+"out" are defined by the physical outward direction, which moves with the geometry, so no
+transform ever swaps them.  The body SDF is a plain scalar SDF and rides the medial path.
 """
 
 from __future__ import annotations
@@ -101,7 +103,22 @@ WF_CHANNELS = ["wf_sin", "wf_cos", "wf_density", "wf_nx", "wf_ny", "wf_nz", "wf_
 #: ``extra.train.winding_source``: where the winding targets come from.
 WINDING_SOURCES = ("coarse", "fine", "merge")
 
-SURFACE_MODES = ("medial", "faces")
+SURFACE_MODES = ("medial", "faces", "body")
+
+
+def body_sdf(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
+    """The orientation-free **body** SDF ``min(sdf_in, -sdf_out)`` (voxels).
+
+    Both face SDFs are positive on the outward side of their own face, so inside a sheet
+    ``sdf_in > 0 > sdf_out`` and the minimum is positive (the distance to the nearer face);
+    outside, it is minus the distance to the crossed face.  It is 0 on both faces *and* on a
+    labelled contact plane, so two sheets that touch stay two distinct ``body > 0`` components.
+    Clipping commutes with ``min``, so the clipped face SDFs give the clipped body SDF.
+
+    The single definition used by the dataset, the training metrics and ``dev/eval_region.py``.
+    """
+    return np.minimum(np.asarray(sdf_in), -np.asarray(sdf_out))
+
 
 # target keys handed to train.py; every item has all of them (fixed shapes)
 TARGET_KEYS = {
@@ -118,8 +135,9 @@ TARGET_KEYS = {
 def target_keys(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
                 band: bool = False, surface_weight: bool = False) -> dict[str, int]:
     """``TARGET_KEYS`` for a surface mode. ``"faces"`` makes ``surface_sdf`` 2 channels
-    ([sdf_in, sdf_out]) and ``surface_valid`` the ``faces_valid`` mask; every other key,
-    and every per-channel augmentation / pooling rule, is unchanged.
+    ([sdf_in, sdf_out]) and ``surface_valid`` the ``faces_valid`` mask; ``"body"`` keeps the
+    single ``surface_sdf`` channel (:func:`body_sdf`) with the same ``faces_valid`` mask;
+    every other key, and every per-channel augmentation / pooling rule, is unchanged.
 
     ``fiber`` adds the fibre targets (:mod:`tsm.fiber`):
 
@@ -809,13 +827,14 @@ class CropDataset(Dataset):
         # exist and are carried through for the teacher-independent metric
         self.has_band_channel = BAND_CHANNEL in self.fine.channels
         self.fiber_band = self.fiber and self.has_band_channel
-        # optional per-voxel surface loss weight (human corrections); faces mode only, since
-        # the channel weights the two-face labels the corrections edit
+        # optional per-voxel surface loss weight (human corrections); faces / body modes only,
+        # since the channel weights the two-face labels the corrections edit (the body SDF is
+        # derived from exactly those two labels)
         self.has_faces_weight = FACES_WEIGHT_CHANNEL in self.fine.channels
-        self.surface_weight = self.surface_mode == "faces" and self.has_faces_weight
+        self.surface_weight = self.surface_mode in ("faces", "body") and self.has_faces_weight
         self.target_keys = target_keys(self.surface_mode, self.fiber, self.fiber_mode,
                                        self.fiber_band, self.surface_weight)
-        self.valid_channel = "faces_valid" if self.surface_mode == "faces" else "sdf_valid"
+        self.valid_channel = "faces_valid" if self.surface_mode in ("faces", "body") else "sdf_valid"
         if self.valid_channel not in self.fine.channels:
             raise ValueError(f"fine store {self.fine.path} has no {self.valid_channel!r} channel "
                              f"(build it with extra.labels.faces.enabled); channels={self.fine.channels}")
@@ -882,6 +901,12 @@ class CropDataset(Dataset):
             sv = store.read("faces_valid", z0, y0, x0, P)
             for i, ch in enumerate(("sdf_in", "sdf_out")):
                 t["surface_sdf"][i] = np.where(sv > 0, decode_sdf(store.read(ch, z0, y0, x0, P)), 0.0)
+        elif self.surface_mode == "body":
+            # orientation-free: one scalar SDF derived from the same two face labels
+            sv = store.read("faces_valid", z0, y0, x0, P)
+            b = body_sdf(decode_sdf(store.read("sdf_in", z0, y0, x0, P)),
+                         decode_sdf(store.read("sdf_out", z0, y0, x0, P)))
+            t["surface_sdf"][0] = np.where(sv > 0, b, 0.0)
         else:
             sv = store.read("sdf_valid", z0, y0, x0, P)
             t["surface_sdf"][0] = np.where(sv > 0, decode_sdf(store.read("sdf", z0, y0, x0, P)), 0.0)
@@ -929,7 +954,11 @@ class CropDataset(Dataset):
                     fiber_raw["fiber_valid"], wn,
                     band=t["fiber_band"] if self.fiber_band else None,
                     band_weight=self.fiber_band_weight,
-                    axis=None if frame is None else frame["axis_dir"])
+                    axis=None if frame is None else frame["axis_dir"],
+                    # the gradient of a *body* SDF is degenerate on the medial ridge (it flips
+                    # sign there), so in that mode the winding normal is the primary sheet
+                    # normal and grad(sdf) only fills its gaps
+                    prefer_fallback=self.surface_mode == "body")
                 for k, v in d.items():
                     t[k] = v.astype(np.float32)
         if self.core_radius_vox > 0:
@@ -1696,7 +1725,14 @@ class Augment:
         m1, mi, mw = (sv == 1).float(), (iv == 1).float(), (wv == 1).float()
         w = batch["winding"].float()
         sdf_in = batch["surface_sdf"].float()
-        ns = int(sdf_in.shape[1])  # 1 (medial) or 2 (faces: [sdf_in, sdf_out]); same rules per channel
+        ns = int(sdf_in.shape[1])  # 1 (medial / body) or 2 (faces: [sdf_in, sdf_out]); same rules per channel
+        # The body SDF (surface_mode="body") is min(sdf_in, -sdf_out) and rides the ns == 1
+        # scalar path unchanged: isotropic scale multiplies it by s_iso, the saturation rule
+        # turns shrunk +-clip labels into valid 2.  min() and resampling commute only up to
+        # sub-voxel effects -- exactly for the cube rotations and flips (which permute voxel
+        # centres), to interpolation accuracy for a continuous rotation / elastic warp -- so
+        # transporting the body SDF is equivalent to transporting the faces and taking the
+        # minimum afterwards.
         parts_cont = [sdf_in * m1, m1, batch["ink_prob"].float() * mi, mi, w * mw, batch["winding_conf"].float() * mw, mw]
         # fiber (optional).  "class" mode: the two probabilities move with the grid like ink
         # (mask-aware trilinear, nearest validity) and are SWAPPED per sample where the
@@ -2060,7 +2096,7 @@ class Augment:
 __all__ = [
     "CLIP", "FINE_CHANNELS", "FACE_CHANNELS", "FIBER_CHANNELS", "COARSE_CHANNELS", "WF_CHANNELS",
     "WINDING_SOURCES", "fine_winding_targets", "merge_winding_targets", "TARGET_KEYS", "target_keys",
-    "SURFACE_MODES", "WINDING_CH", "FIBER_MODES", "FIBER_TARGET_KEYS", "FIBER_BAND_WEIGHT", "BAND_CHANNEL",
+    "SURFACE_MODES", "body_sdf", "WINDING_CH", "FIBER_MODES", "FIBER_TARGET_KEYS", "FIBER_BAND_WEIGHT", "BAND_CHANNEL",
     "LabelStore", "CropDataset", "MultiStoreDataset", "build_origins", "augment", "spatial_transform", "intensity_augment",
     "Augment", "AugmentConfig", "SpatialParams", "PRESETS", "TRANSFORM_NAMES", "SPATIAL_NAMES", "INTENSITY_NAMES",
     "SCAN_NAMES", "WindowCfg", "ClassContrastCfg", "AnisoBlurCfg", "RingCfg", "StripeCfg", "SpectralNoiseCfg",

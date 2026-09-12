@@ -84,15 +84,17 @@ def fiber_head(fiber_mode: str = "class") -> dict[str, int]:
 
 
 def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> dict[str, int]:
-    """Head widths for a surface mode: "medial" (default) or "faces" (surface head = 3);
+    """Head widths for a surface mode: "medial" (default), "faces" (surface head = 3) or
+    "body" (the orientation-free ``min(sdf_in, -sdf_out)``: the *medial* widths, surface head
+    = 2 = [sdf_body, valid logit], so the export / TRT layout is unchanged);
     ``fiber`` appends the fibre head in either mode (2 channels in the ``"class"`` mode,
     4 in ``"direction"``)."""
     if surface_mode == "faces":
         h = dict(FACE_HEADS)
-    elif surface_mode == "medial":
+    elif surface_mode in ("medial", "body"):
         h = dict(HEADS)
     else:
-        raise ValueError(f"surface_mode must be 'medial' or 'faces', got {surface_mode!r}")
+        raise ValueError(f"surface_mode must be 'medial', 'faces' or 'body', got {surface_mode!r}")
     if fiber:
         h.update(fiber_head(fiber_mode))
     return h

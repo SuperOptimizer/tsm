@@ -114,7 +114,7 @@ class Layer:
 _PROB = (
     "valid", "ink", "conf", "spare", "recto", "surface", "m7",
     "fiber_bg", "fiber_vt", "fiber_hz", "fiber_ink", "fiber_strength",
-    "surface1", "surface_in1", "surface_out1",
+    "surface1", "surface_in1", "surface_out1", "surface_body1",
 )
 #: signed [-1, 1] scalars that are not part of a vector
 _SIGNED = ("sin", "cos", "phase_sin", "phase_cos", "grad_mag")
@@ -124,7 +124,7 @@ _VEC = {
     "fiber_dx": ("fiber_dir", 0), "fiber_dy": ("fiber_dir", 1), "fiber_dz": ("fiber_dir", 2),
 }
 #: signed-distance channels (kind ``sdf``, ``clip`` required)
-_SDF = ("sdf", "sdf_in", "sdf_out")
+_SDF = ("sdf", "sdf_in", "sdf_out", "sdf_body")
 #: categorical channels and their class names
 _CLASS = {
     "sdf_valid": ("invalid", "valid", "ignore"),
@@ -421,7 +421,8 @@ class StudentSource(Source):
         vals = {name: sink.a[i] for i, name in enumerate(sink.channels)}
         # the derived channels of `tsm infer`'s second pass, on this box alone
         val = vals.get("valid", np.full(tuple(int(v) for v in dims), 255, np.uint8))
-        for surf, sdf in (("surface1", "sdf"), ("surface_in1", "sdf_in"), ("surface_out1", "sdf_out")):
+        for surf, sdf in (("surface1", "sdf"), ("surface_in1", "sdf_in"), ("surface_out1", "sdf_out"),
+                          ("surface_body1", "sdf_body")):
             if surf in self.channels and sdf in vals:
                 vals[surf] = (extract_surface(vals[sdf], val, self.clip).astype(np.uint8) * 255)
         if "thickness" in self.channels and "sdf_in" in vals and "sdf_out" in vals:
