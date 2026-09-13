@@ -33,7 +33,7 @@ import math
 import os
 import shutil
 import time
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -59,6 +59,7 @@ __all__ = [
     "n_head_ch",
     "N_HEAD_CH",
     "BODY_PRED_CHANNELS",
+    "SIDES_PRED_CHANNELS",
     "N_BODY_HEAD_CH",
     "INFER_DEFAULTS",
     "EXPORT_DEFAULTS",
@@ -100,6 +101,16 @@ N_FACE_HEAD_CH = 12
 BODY_PRED_CHANNELS = ["sdf_body", "valid", "ink", "sin", "cos", "density", "nx", "ny", "nz", "conf", "spare",
                       "surface_body1"]
 N_BODY_HEAD_CH = 11
+# orientation-free "sides" mode (extra.train.surface_mode = "sides"): the TWO-FACE head layout
+# (surface 3 + ink 1 + winding 8) with the three surface channels being the UNSIGNED distance to
+# the nearest face, the sheet-body probability and the validity -- so the export / TRT layout is
+# identical to the two-face one.  `d_face` is written with the SAME byte encoding as any SDF
+# (128 + clip(d)*127/clip), so an existing sdf reader decodes it as a non-negative distance; the
+# derived `surface_side1` is the 2-voxel shell `d_face <= 1` (both sides of every face at once).
+# No thickness channel: the mode names no sides.
+SIDES_PRED_CHANNELS = ["d_face", "body", "valid", "ink", "sin", "cos", "density", "nx", "ny", "nz", "conf",
+                       "spare", "surface_side1"]
+N_SIDES_HEAD_CH = 12
 # optional fibre head (2 logits): appended after the winding channels, before the derived
 # surface1 / thickness channels, so an old store is a prefix of a new one only up to `spare`.
 FIBER_PRED_CHANNELS = ["fiber_vt", "fiber_hz"]
@@ -112,7 +123,8 @@ N_FIBER_DIR_HEAD_CH = 4
 
 
 def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> list[str]:
-    base = {"faces": FACE_PRED_CHANNELS, "body": BODY_PRED_CHANNELS}.get(surface_mode, PRED_CHANNELS)
+    base = {"faces": FACE_PRED_CHANNELS, "body": BODY_PRED_CHANNELS,
+            "sides": SIDES_PRED_CHANNELS}.get(surface_mode, PRED_CHANNELS)
     base = list(base)
     if not fiber:
         return base
@@ -124,7 +136,8 @@ def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode:
 
 
 def n_head_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> int:
-    n = {"faces": N_FACE_HEAD_CH, "body": N_BODY_HEAD_CH}.get(surface_mode, N_HEAD_CH)
+    n = {"faces": N_FACE_HEAD_CH, "body": N_BODY_HEAD_CH,
+         "sides": N_SIDES_HEAD_CH}.get(surface_mode, N_HEAD_CH)
     if not fiber:
         return n
     return n + (N_FIBER_DIR_HEAD_CH if fiber_mode == "direction" else N_FIBER_HEAD_CH)
@@ -263,8 +276,15 @@ def activate_heads(out: dict[str, torch.Tensor], surface_mode: str = "medial",
     ns = 2 if surface_mode == "faces" else 1  # "body" is one channel, like "medial"
     sc = F.normalize(w[:, 0:2], dim=1, eps=1e-6)
     n = F.normalize(w[:, 3:6], dim=1, eps=1e-6)
-    parts = [s[:, 0:ns], torch.sigmoid(s[:, ns:ns + 1]), torch.sigmoid(i[:, 0:1]), sc, torch.relu(w[:, 2:3]), n,
-             torch.sigmoid(w[:, 6:7]), torch.sigmoid(w[:, 7:8])]
+    if surface_mode == "sides":
+        # [d_face, body logit, valid logit]: the distance is relu'd (training used the raw head
+        # output, relu only enforces the >= 0 the target already guarantees), the other two are
+        # probabilities
+        head = [torch.relu(s[:, 0:1]), torch.sigmoid(s[:, 1:3])]
+    else:
+        head = [s[:, 0:ns], torch.sigmoid(s[:, ns:ns + 1])]
+    parts = head + [torch.sigmoid(i[:, 0:1]), sc, torch.relu(w[:, 2:3]), n,
+                    torch.sigmoid(w[:, 6:7]), torch.sigmoid(w[:, 7:8])]
     if "fiber" in out:
         f = out["fiber"].float()
         if fiber_mode == "direction":  # [dz, dy, dx, strength], appended after `spare`
@@ -279,34 +299,60 @@ def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
     """(B, 11 | 12, ...) physical values -> [0, 1] so that round(u*255) is the label-store byte.
 
     sdf -> (128 + clip(sdf)*127/clip)/255 (bytes 1..255, 0 stays "no data"); in the two-face mode
-    both sdf channels use that encoding.  sin/cos/normal -> (v+1)/2 (= 127.5 + 127.5 v);
+    both sdf channels use that encoding, and in the "sides" mode ``d_face`` uses it too (clamped
+    to [0, clip], so its bytes are always >= 128 and any sdf reader sees a non-negative distance)
+    while ``body`` is a probability.  sin/cos/normal -> (v+1)/2 (= 127.5 + 127.5 v);
     density -> v*1000/255; probabilities as is."""
     clip = float(clip)
     ns = 2 if surface_mode == "faces" else 1
-    sdf = (128.0 + phys[:, 0:ns].clamp(-clip, clip) * (127.0 / clip)) / 255.0
     signed = lambda t: (t + 1.0) * 0.5  # noqa: E731
-    o = ns - 1
+    if surface_mode == "sides":
+        # d_face uses the SAME sdf byte encoding, clamped to [0, clip] so every byte is >= 128:
+        # any reader that decodes an sdf channel reads it back as a non-negative distance.
+        # `body` is a plain probability.
+        o = 1
+        head = [(128.0 + phys[:, 0:1].clamp(0.0, clip) * (127.0 / clip)) / 255.0, phys[:, 1:4]]
+    else:
+        o = ns - 1
+        head = [(128.0 + phys[:, 0:ns].clamp(-clip, clip) * (127.0 / clip)) / 255.0,
+                phys[:, 1 + o:3 + o]]
     tail = phys[:, 9 + o:]  # conf, spare, then the fibre head
     if fiber_mode == "direction" and tail.shape[1] >= 6:
         # [conf, spare, dz, dy, dx, strength]: the direction is signed like a normal
         tail = torch.cat([tail[:, 0:2], signed(tail[:, 2:5]), tail[:, 5:]], dim=1)
     u = torch.cat(
-        [sdf, phys[:, 1 + o:3 + o], signed(phys[:, 3 + o:5 + o]), phys[:, 5 + o:6 + o] * (GRAD_MAG_ENCODE_SCALE / 255.0),
-         signed(phys[:, 6 + o:9 + o]), tail], dim=1,
+        head + [signed(phys[:, 3 + o:5 + o]), phys[:, 5 + o:6 + o] * (GRAD_MAG_ENCODE_SCALE / 255.0),
+                signed(phys[:, 6 + o:9 + o]), tail], dim=1,
     )
     return u.clamp(0.0, 1.0)
+
+
+def pred_dt_field(dec: Mapping[str, np.ndarray], dt_ch: str) -> np.ndarray:
+    """The **signed** distance field the lasagna ``pred_dt`` encoding wants, from ``decode_pred``.
+
+    Every mode but ``"sides"`` already has one (``sdf_in`` / ``sdf_body`` / ``sdf``).  In sides
+    mode the store carries the unsigned ``d_face`` plus the body probability, so the sign is put
+    back here: ``where(body > 0.5, d_face, -d_face)`` -- positive inside the papyrus, negative
+    outside, 0 on the faces, exactly like the body SDF."""
+    if dt_ch == "d_face" and "body" in dec:
+        return np.where(dec["body"] > 0.5, dec["d_face"], -dec["d_face"]).astype(np.float32)
+    return dec[dt_ch]
 
 
 def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHANNELS) -> dict[str, np.ndarray]:
     """(C, ...) pred.zarr bytes -> float32 fields + ``data`` (sdf byte != 0) and ``surface1`` (bool)."""
     ch = {name: u8[k] for k, name in enumerate(channels)}
-    sdf_names = [k for k in ("sdf", "sdf_in", "sdf_out", "sdf_body") if k in ch]
+    sdf_names = [k for k in ("sdf", "sdf_in", "sdf_out", "sdf_body", "d_face") if k in ch]
     out: dict[str, np.ndarray] = {"data": ch[sdf_names[0]] != 0}
     for k in sdf_names:
         out[k] = decode_sdf(ch[k], clip) * out["data"]
-    if "sdf" not in out and "sdf_in" in out:
-        out["sdf"] = out["sdf_in"]  # the in face is the default "the surface" (see docs)
-    for k in ("valid", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength"):
+    if "sdf" not in out:
+        # the default "the surface" field of a store that has no plain `sdf` channel: the in
+        # face (two-face), the body SDF (body mode) or the unsigned face distance (sides mode)
+        alias = next((k for k in ("sdf_in", "sdf_body", "d_face") if k in out), None)
+        if alias is not None:
+            out["sdf"] = out[alias]
+    for k in ("valid", "body", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength"):
         if k in ch:
             out[k] = decode_prob(ch[k])
     for k in ("fiber_dz", "fiber_dy", "fiber_dx"):
@@ -315,7 +361,7 @@ def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHAN
     for k in ("sin", "cos", "nx", "ny", "nz"):
         out[k] = decode_signed(ch[k])
     out["density"] = decode_density(ch["density"])
-    for k in ("surface1", "surface_in1", "surface_out1", "surface_body1"):
+    for k in ("surface1", "surface_in1", "surface_out1", "surface_body1", "surface_side1"):
         if k in ch:
             out[k] = ch[k] > 127
     if "thickness" in ch:
@@ -658,7 +704,7 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
     for need in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength", "fiber_vt", "fiber_hz"):
         if need not in ch:
             raise ValueError(f"{pred_path} has no {need!r} channel (channels={ch})")
-    sdf_name = next(k for k in ("sdf_in", "sdf_body", "sdf") if k in ch)
+    sdf_name = next(k for k in ("sdf_in", "sdf_body", "sdf", "d_face") if k in ch)
     idx = {n: ch.index(n) for n in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength",
                                     "fiber_vt", "fiber_hz", sdf_name)}
     shape = tuple(int(s) for s in arr.shape[1:])
@@ -706,13 +752,19 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
     Medial mode: ``surface1`` from ``sdf``.  Two-face mode: ``surface_in1`` from ``sdf_in``,
     ``surface_out1`` from ``sdf_out`` and ``thickness`` = round(clip(sdf_in - sdf_out, 0, 255))
     (the gap between the two zero sets, in voxels, 0 outside the sheet / no data).  Body mode:
-    ``surface_body1`` from ``sdf_body`` and no thickness pass (the body SDF names no sides)."""
+    ``surface_body1`` from ``sdf_body`` and no thickness pass (the body SDF names no sides).
+    Sides mode: ``surface_side1`` = ``(d_face <= 1) & (valid >= 0.5)``, a 2-voxel-thick shell
+    around every face (pointwise -- an unsigned distance has no zero crossing to extract), and
+    again no thickness pass."""
     log = log or (lambda m: print(m, flush=True))
     arr = zarr.open_array(store=pred_path, mode="r+")
     ch = list(arr.attrs["channels"])
     faces = "sdf_in" in ch
+    sides = "d_face" in ch
     if faces:
         pairs = [("surface_in1", "sdf_in"), ("surface_out1", "sdf_out")]
+    elif sides:
+        pairs = [("surface_side1", "d_face")]
     elif "sdf_body" in ch:
         pairs = [("surface_body1", "sdf_body")]
     else:
@@ -728,7 +780,14 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
             lo_h, hi_h = [v - 1 for v in lo], [v + 1 for v in hi]
             sdf_box = read_box_padded(arr, lo_h, hi_h, channels=isdf)[0]
             val_box = read_box_padded(arr, lo_h, hi_h, channels=ival)[0]
-            surf = extract_surface(sdf_box, val_box, clip)[1:-1, 1:-1, 1:-1]
+            if sides:
+                # no zero CROSSING to find: d_face is unsigned, so the sheet sides are the
+                # 2-voxel-thick shell d_face <= 1 (pointwise, both sides of every face at once,
+                # matching the 2-voxel tolerance of the upstream Dice)
+                surf = ((sdf_box != 0) & (decode_sdf(sdf_box, clip) <= 1.0)
+                        & (val_box >= 128))[1:-1, 1:-1, 1:-1]
+            else:
+                surf = extract_surface(sdf_box, val_box, clip)[1:-1, 1:-1, 1:-1]
             n_surf += int(surf.sum())
             n_data += int((sdf_box[1:-1, 1:-1, 1:-1] != 0).sum())
             arr[ci, lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = surf.astype(np.uint8) * 255
@@ -790,6 +849,14 @@ def _preview_slices(pred_path: str, clip: float, max_dim: int = 2048) -> dict[st
         rgb = np.repeat(g("sdf_body")[..., None], 3, axis=-1).copy()
         rgb[g("surface_body1") > 127] = (255, 0, 0)
         return {"sdf_body": rgb, **common}
+    if "d_face" in ch:
+        # grey face distance, red sheet sides, a blue tint where the body head fires
+        rgb = np.repeat(g("d_face")[..., None], 3, axis=-1).astype(np.uint16)
+        bod = g("body") > 127
+        rgb[bod, 2] = np.minimum(255, rgb[bod, 2] + 80)
+        rgb = rgb.astype(np.uint8)
+        rgb[g("surface_side1") > 127] = (255, 0, 0)
+        return {"d_face": rgb, "body": g("body"), **common}
     sdf_rgb = np.repeat(g("sdf")[..., None], 3, axis=-1).copy()
     sdf_rgb[g("surface1") > 127] = (255, 0, 0)
     return {"sdf": sdf_rgb, **common}
@@ -956,6 +1023,10 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
             "sin|cos|nx|ny|nz|fiber_dz|fiber_dy|fiber_dx": "127.5 + 127.5 v",
             "density": "relu(v) * 1000, wraps per voxel at voxel_um",
             "surface1|surface_in1|surface_out1|surface_body1": "255 on the 1-voxel surface",
+            "d_face": (f"round(128 + clip(d_face, 0, {clip:g})*127/{clip:g}); the UNSIGNED distance "
+                       f"to the nearest sheet face, bytes >= 128, 0 = no data (sides mode)"),
+            "body": "sigmoid * 255: P(this voxel is papyrus body) (sides mode)",
+            "surface_side1": "255 where d_face <= 1 and valid >= 0.5 (sides mode)",
             "thickness": "round(clip(sdf_in - sdf_out, 0, 255)) voxels (two-face mode)",
         },
         "peak_rss_mb": peak_rss_mb(),
@@ -1208,7 +1279,7 @@ def export_lasagna(
     arr, attrs = _open_pred(pred_store)
     clip = _pred_clip(pred_store, clip)
     ch = list(attrs["channels"])
-    dt_ch = str(pred_dt_channel or next(k for k in ("sdf_in", "sdf_body", "sdf") if k in ch))
+    dt_ch = str(pred_dt_channel or next(k for k in ("sdf_in", "sdf_body", "sdf", "d_face") if k in ch))
     if dt_ch not in ch:
         raise ValueError(f"pred_dt_channel {dt_ch!r} not in the prediction store ({ch})")
     origin, shape = attrs["origin_zyx"], attrs["shape_zyx"]
@@ -1242,7 +1313,8 @@ def export_lasagna(
         dec = decode_pred(blk, clip, ch)
         mask = _valid_mask(dec)
         # cos level: cos (renormalised with sin) and pred_dt bytes
-        vals = np.stack([dec["sin"], dec["cos"], encode_pred_dt(dec[dt_ch], dec["data"], sheet_half_vox).astype(np.float32)])
+        vals = np.stack([dec["sin"], dec["cos"],
+                         encode_pred_dt(pred_dt_field(dec, dt_ch), dec["data"], sheet_half_vox).astype(np.float32)])
         m, cover = pool_mean(vals, mask, f_cos)
         ok = cover >= float(min_cover)
         sc = _renorm(m[0:2])

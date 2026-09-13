@@ -114,7 +114,9 @@ class Layer:
 _PROB = (
     "valid", "ink", "conf", "spare", "recto", "surface", "m7",
     "fiber_bg", "fiber_vt", "fiber_hz", "fiber_ink", "fiber_strength",
-    "surface1", "surface_in1", "surface_out1", "surface_body1",
+    "surface1", "surface_in1", "surface_out1", "surface_body1", "surface_side1",
+    # surface_mode "sides": the sheet-body probability head
+    "body",
 )
 #: signed [-1, 1] scalars that are not part of a vector
 _SIGNED = ("sin", "cos", "phase_sin", "phase_cos", "grad_mag")
@@ -124,7 +126,9 @@ _VEC = {
     "fiber_dx": ("fiber_dir", 0), "fiber_dy": ("fiber_dir", 1), "fiber_dz": ("fiber_dir", 2),
 }
 #: signed-distance channels (kind ``sdf``, ``clip`` required)
-_SDF = ("sdf", "sdf_in", "sdf_out", "sdf_body")
+#: ``d_face`` (surface_mode "sides") is UNSIGNED but carries the same byte encoding, so the
+#: sdf decoding reads it back as a non-negative distance
+_SDF = ("sdf", "sdf_in", "sdf_out", "sdf_body", "d_face")
 #: categorical channels and their class names
 _CLASS = {
     "sdf_valid": ("invalid", "valid", "ignore"),

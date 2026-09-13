@@ -51,10 +51,16 @@ Surface mode (``surface_mode``, ``extra.train.surface_mode``): "medial" (default
 unchanged: ``surface_sdf`` = the single SDF to the recto medial surface, mask
 ``sdf_valid``), "faces" (``surface_sdf`` = the 2-channel [sdf_in, sdf_out] of
 the two-face labels, mask ``faces_valid``) or "body" (orientation-free: ``surface_sdf``
-= the single channel ``min(sdf_in, -sdf_out)`` of :func:`body_sdf`, mask ``faces_valid``).
+= the single channel ``min(sdf_in, -sdf_out)`` of :func:`body_sdf`, mask ``faces_valid``) or
+"sides" (orientation-free with the magnitude and the sign split in two: ``surface_sdf`` = the
+UNSIGNED ``min(|sdf_in|, |sdf_out|)`` of :func:`face_dist` and ``surface_body`` = the 0/1
+``(sdf_in > 0) & (sdf_out < 0)`` mask of :func:`body_mask_np`, both on ``faces_valid``).
 The two face channels obey exactly the same augmentation rules as the single sdf: "in" and
 "out" are defined by the physical outward direction, which moves with the geometry, so no
 transform ever swaps them.  The body SDF is a plain scalar SDF and rides the medial path.
+In "sides" mode the face distance rides that same scalar path (it is >= 0, so the
+saturation rule and the isotropic ``s_iso`` factor apply unchanged) and the body mask moves with the grid like ``ink_prob``;
+neither has a sign or a side to swap, so every flip and rotation leaves them alone.
 """
 
 from __future__ import annotations
@@ -93,8 +99,11 @@ FIBER_BAND_WEIGHT = 5.0
 #: the ``surface_weight`` target key, which multiplies every surface-loss mask in train.py.
 FACES_WEIGHT_CHANNEL = "faces_weight"
 SURFACE_WEIGHT_KEY = "surface_weight"
-#: target keys that are neither in ``TARGET_KEYS`` nor fibre keys (optional, store-driven)
-EXTRA_TARGET_KEYS = (SURFACE_WEIGHT_KEY,)
+#: the 0/1 sheet-body occupancy target of ``surface_mode="sides"`` (:func:`body_mask_np`); it
+#: is a plain [0, 1] scalar field and moves with the grid exactly like ``ink_prob``
+SURFACE_BODY_KEY = "surface_body"
+#: target keys that are neither in ``TARGET_KEYS`` nor fibre keys (optional, mode/store-driven)
+EXTRA_TARGET_KEYS = (SURFACE_WEIGHT_KEY, SURFACE_BODY_KEY)
 COARSE_CHANNELS = ["phase_sin", "phase_cos", "density", "nx", "ny", "nz", "conf", "valid"]
 #: the native-2.4 um winding block (tsm.winding_fine); present only in stores built with
 #: ``extra.labels.winding_fine``.  Same encodings as the coarse channels above, except that
@@ -103,7 +112,7 @@ WF_CHANNELS = ["wf_sin", "wf_cos", "wf_density", "wf_nx", "wf_ny", "wf_nz", "wf_
 #: ``extra.train.winding_source``: where the winding targets come from.
 WINDING_SOURCES = ("coarse", "fine", "merge")
 
-SURFACE_MODES = ("medial", "faces", "body")
+SURFACE_MODES = ("medial", "faces", "body", "sides")
 
 
 def body_sdf(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
@@ -118,6 +127,29 @@ def body_sdf(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
     The single definition used by the dataset, the training metrics and ``dev/eval_region.py``.
     """
     return np.minimum(np.asarray(sdf_in), -np.asarray(sdf_out))
+
+
+def face_dist(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
+    """The orientation-free **unsigned** distance to the nearest face, ``min(|sdf_in|, |sdf_out|)``.
+
+    The magnitude half of ``surface_mode="sides"``.  It is 0 on both faces *and* on a labelled
+    contact plane, >= 0 everywhere, and says nothing about which side of which face a voxel is
+    on -- no naming, no sign flip, and (unlike :func:`body_sdf`) no dependence on the sheet
+    thickness.  Clipping commutes with ``min`` and with ``abs`` on a symmetric clip, so the
+    clipped face SDFs give the clipped face distance.
+
+    The single definition used by the dataset, the training metrics and ``dev/eval_region.py``.
+    """
+    return np.minimum(np.abs(np.asarray(sdf_in)), np.abs(np.asarray(sdf_out)))
+
+
+def body_mask_np(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
+    """The sheet **body** as a boolean mask: ``(sdf_in > 0) & (sdf_out < 0)``.
+
+    The sign half of ``surface_mode="sides"`` -- exactly ``body_sdf(...) > 0``, but written as a
+    plain 0/1 occupancy so the network can classify it instead of regressing a signed field
+    whose interior magnitude depends on the (noisy, 20-70 voxel) sheet thickness."""
+    return (np.asarray(sdf_in) > 0) & (np.asarray(sdf_out) < 0)
 
 
 # target keys handed to train.py; every item has all of them (fixed shapes)
@@ -162,6 +194,10 @@ def target_keys(surface_mode: str = "medial", fiber: bool = False, fiber_mode: s
     t = dict(TARGET_KEYS)
     if surface_mode == "faces":
         t["surface_sdf"] = 2
+    if surface_mode == "sides":
+        # magnitude + sign split in two: surface_sdf is the UNSIGNED face distance
+        # (:func:`face_dist`) and surface_body the 0/1 body mask (:func:`body_mask_np`)
+        t["surface_body"] = 1
     if fiber:
         if fiber_mode not in FIBER_MODES:
             raise ValueError(f"fiber_mode must be one of {list(FIBER_MODES)}, got {fiber_mode!r}")
@@ -831,10 +867,10 @@ class CropDataset(Dataset):
         # since the channel weights the two-face labels the corrections edit (the body SDF is
         # derived from exactly those two labels)
         self.has_faces_weight = FACES_WEIGHT_CHANNEL in self.fine.channels
-        self.surface_weight = self.surface_mode in ("faces", "body") and self.has_faces_weight
+        self.surface_weight = self.surface_mode in ("faces", "body", "sides") and self.has_faces_weight
         self.target_keys = target_keys(self.surface_mode, self.fiber, self.fiber_mode,
                                        self.fiber_band, self.surface_weight)
-        self.valid_channel = "faces_valid" if self.surface_mode in ("faces", "body") else "sdf_valid"
+        self.valid_channel = "faces_valid" if self.surface_mode in ("faces", "body", "sides") else "sdf_valid"
         if self.valid_channel not in self.fine.channels:
             raise ValueError(f"fine store {self.fine.path} has no {self.valid_channel!r} channel "
                              f"(build it with extra.labels.faces.enabled); channels={self.fine.channels}")
@@ -907,6 +943,15 @@ class CropDataset(Dataset):
             b = body_sdf(decode_sdf(store.read("sdf_in", z0, y0, x0, P)),
                          decode_sdf(store.read("sdf_out", z0, y0, x0, P)))
             t["surface_sdf"][0] = np.where(sv > 0, b, 0.0)
+        elif self.surface_mode == "sides":
+            # orientation-free, magnitude and sign split: the UNSIGNED distance to the nearest
+            # face (a regression that never hedges across a sign flip) plus the body occupancy
+            # as a classification.  Both come from the same two face labels, no relabelling.
+            sv = store.read("faces_valid", z0, y0, x0, P)
+            si = decode_sdf(store.read("sdf_in", z0, y0, x0, P))
+            so = decode_sdf(store.read("sdf_out", z0, y0, x0, P))
+            t["surface_sdf"][0] = np.where(sv > 0, face_dist(si, so), 0.0)
+            t["surface_body"][0] = np.where(sv > 0, body_mask_np(si, so), False).astype(np.float32)
         else:
             sv = store.read("sdf_valid", z0, y0, x0, P)
             t["surface_sdf"][0] = np.where(sv > 0, decode_sdf(store.read("sdf", z0, y0, x0, P)), 0.0)
@@ -958,7 +1003,7 @@ class CropDataset(Dataset):
                     # the gradient of a *body* SDF is degenerate on the medial ridge (it flips
                     # sign there), so in that mode the winding normal is the primary sheet
                     # normal and grad(sdf) only fills its gaps
-                    prefer_fallback=self.surface_mode == "body")
+                    prefer_fallback=self.surface_mode in ("body", "sides"))
                 for k, v in d.items():
                     t[k] = v.astype(np.float32)
         if self.core_radius_vox > 0:
@@ -1760,6 +1805,12 @@ class Augment:
         sw = SURFACE_WEIGHT_KEY in batch
         if sw:
             parts_cont.append(batch[SURFACE_WEIGHT_KEY].float() * m1)
+        # surface_mode="sides": the 0/1 body occupancy.  A probability-like scalar in [0, 1]
+        # with no sign and no side, so it moves with the grid exactly like ink_prob
+        # (mask-aware trilinear on the surface validity); flips and rotations leave it alone.
+        sb = "surface_body" in batch
+        if sb:
+            parts_cont.append(batch["surface_body"].float() * m1)
         cont = torch.cat(parts_cont, dim=1)
         s = F.grid_sample(cont, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         mask_in = torch.cat([sv, iv, wv] + ([fv] if fb else []) + ([batch["fiber_band"].float()] if fb_band else []), dim=1)
@@ -1820,10 +1871,14 @@ class Augment:
                 # the human codes name the same two axis-relative classes, so they follow the
                 # same (nearest-class) rule as the probabilities
                 out["fiber_band"] = torch.where(swap, swap_band_class(band), band) if self.fiber_swap else band
+        a_sw = ns + 11 + n_fib
         if sw:
-            w_t = div(s[:, ns + 11 + n_fib:ns + 12 + n_fib], den_s)
+            w_t = div(s[:, a_sw:a_sw + 1], den_s)
             # outside the resampled surface support the weight is undetermined -> 1 (neutral)
             out[SURFACE_WEIGHT_KEY] = torch.where(w_t > 1e-6, w_t, torch.ones_like(w_t))
+        if sb:
+            a_sb = a_sw + (1 if sw else 0)
+            out["surface_body"] = div(s[:, a_sb:a_sb + 1], den_s).clamp(0.0, 1.0) * (sv_t > 0).float()
         return out
 
     # ---- intensity ------------------------------------------------------------------ #
@@ -2096,7 +2151,7 @@ class Augment:
 __all__ = [
     "CLIP", "FINE_CHANNELS", "FACE_CHANNELS", "FIBER_CHANNELS", "COARSE_CHANNELS", "WF_CHANNELS",
     "WINDING_SOURCES", "fine_winding_targets", "merge_winding_targets", "TARGET_KEYS", "target_keys",
-    "SURFACE_MODES", "body_sdf", "WINDING_CH", "FIBER_MODES", "FIBER_TARGET_KEYS", "FIBER_BAND_WEIGHT", "BAND_CHANNEL",
+    "SURFACE_MODES", "body_sdf", "face_dist", "body_mask_np", "SURFACE_BODY_KEY", "WINDING_CH", "FIBER_MODES", "FIBER_TARGET_KEYS", "FIBER_BAND_WEIGHT", "BAND_CHANNEL",
     "LabelStore", "CropDataset", "MultiStoreDataset", "build_origins", "augment", "spatial_transform", "intensity_augment",
     "Augment", "AugmentConfig", "SpatialParams", "PRESETS", "TRANSFORM_NAMES", "SPATIAL_NAMES", "INTENSITY_NAMES",
     "SCAN_NAMES", "WindowCfg", "ClassContrastCfg", "AnisoBlurCfg", "RingCfg", "StripeCfg", "SpectralNoiseCfg",

@@ -29,6 +29,7 @@ in-place ops on views and no Python branching on tensor values.  Use
 Heads (1x1x1 convs on the decoder features):
   surface (2) = [sdf (voxels, clipped), valid logit]
               (3) = [sdf_in, sdf_out, valid logit] in the two-face mode (``heads_for("faces")``)
+              or [d_face, body logit, valid logit] in the "sides" mode (``heads_for("sides")``)
   ink     (1) = ink logit
   fiber   (2) = [vertical fiber logit, horizontal/angular fiber logit] (optional,
               ``heads_for(..., fiber=True)``)
@@ -63,7 +64,8 @@ RADIAL_CHANNELS = ["r_z", "r_y", "r_x"]  # outward unit radial (perpendicular to
 # both defined relative to the axis, which an all-axes rotation otherwise hides from the net.
 AXIS_CHANNELS = ["a_z", "a_y", "a_x"]  # unit umbilicus tangent (z, y, x); r . a == 0
 HEADS: dict[str, int] = {"surface": 2, "ink": 1, "winding": 8}
-# two-face surface mode (extra.train.surface_mode = "faces"): [sdf_in, sdf_out, valid logit]
+# two-face surface mode (extra.train.surface_mode = "faces"): [sdf_in, sdf_out, valid logit].
+# The same 3-wide head carries surface_mode "sides": [d_face, body logit, valid logit].
 FACE_HEADS: dict[str, int] = {"surface": 3, "ink": 1, "winding": 8}
 # optional fibre-orientation head (extra.train.heads.fiber): [vertical logit, horizontal/angular
 # logit], distilled from the 4-class fiber teacher's softmax channels 1 and 2.
@@ -86,15 +88,19 @@ def fiber_head(fiber_mode: str = "class") -> dict[str, int]:
 def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> dict[str, int]:
     """Head widths for a surface mode: "medial" (default), "faces" (surface head = 3) or
     "body" (the orientation-free ``min(sdf_in, -sdf_out)``: the *medial* widths, surface head
-    = 2 = [sdf_body, valid logit], so the export / TRT layout is unchanged);
+    = 2 = [sdf_body, valid logit], so the export / TRT layout is unchanged) or "sides"
+    (orientation-free with the magnitude and the sign split: surface head = 3 =
+    [d_face (raw voxels), body logit, valid logit] -- the same width as the two-face head, so
+    again nothing in the export / TRT layout changes);
     ``fiber`` appends the fibre head in either mode (2 channels in the ``"class"`` mode,
     4 in ``"direction"``)."""
-    if surface_mode == "faces":
+    if surface_mode in ("faces", "sides"):
         h = dict(FACE_HEADS)
     elif surface_mode in ("medial", "body"):
         h = dict(HEADS)
     else:
-        raise ValueError(f"surface_mode must be 'medial', 'faces' or 'body', got {surface_mode!r}")
+        raise ValueError(f"surface_mode must be 'medial', 'faces', 'body' or 'sides', "
+                         f"got {surface_mode!r}")
     if fiber:
         h.update(fiber_head(fiber_mode))
     return h

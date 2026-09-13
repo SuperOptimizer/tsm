@@ -18,7 +18,12 @@ the coarse store by the dataset.  Losses (all masked by the target valid masks):
            [sdf_body, valid] against ``data.body_sdf`` = min(sdf_in, -sdf_out) (``body_loss``):
            the medial terms on the single channel, plus the same optional aux terms with the
            body as its own "face" (``shell_body`` / ``crest_body`` / ``far_body``) and the
-           single-target form of ``gap`` / ``cldice``.  Default
+           single-target form of ``gap`` / ``cldice``.
+           ``extra.train.surface_mode = "sides"`` trains the *orientation-free* 3-channel head
+           [d_face, body logit, valid] (``sides_loss``): the magnitude and the sign of the body
+           SDF split apart, ``data.face_dist`` = min(|sdf_in|, |sdf_out|) regressed (L1 + band
+           Dice) and ``data.body_mask_np`` = (sdf_in>0)&(sdf_out<0) classified (BCE + soft
+           Dice), so neither part hedges near zero the way the signed body SDF does.  Default
            "medial" (the single SDF to the recto medial surface) is unchanged.
   ink:     BCE (``pos_weight`` from ``extra.train.ink_pos_weight``: "auto" = this batch's
            sum(1-p)/sum(p) over valid==1, clamped to [1, 50]; a number; or null/0 = off)
@@ -478,7 +483,8 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
 
     Every weight defaults to 0; with all three at 0 the surface loss is byte-identical to the
     historical one, so this is safe to leave in a config.  The terms only exist in
-    ``surface_mode="faces"`` and ``"body"`` -- asking for them in ``"medial"`` mode is an error
+    ``surface_mode="faces"``, ``"body"`` and ``"sides"`` -- asking for them in ``"medial"`` mode
+    is an error
     rather than a silent no-op."""
     if raw is None or raw is False:
         return dict(SURFACE_AUX_DEFAULTS)
@@ -501,8 +507,9 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
         out[k] = int(r)
     if out["gap"] > 0 and out["gap_tau"] <= 0:
         raise ValueError("extra.train.surface_aux.gap_tau must be > 0 when gap > 0")
-    if surface_aux_active(out) and surface_mode not in ("faces", "body"):
-        raise ValueError("extra.train.surface_aux needs extra.train.surface_mode='faces' or 'body'")
+    if surface_aux_active(out) and surface_mode not in ("faces", "body", "sides"):
+        raise ValueError("extra.train.surface_aux needs extra.train.surface_mode='faces' "
+                         "or 'body' or 'sides'")
     if out["shell"] > 0 and out["shell_radius"] < out["shell_margin"]:
         print(f"[tsm] WARNING surface_aux.shell_radius {out['shell_radius']} < shell_margin "
               f"{out['shell_margin']}: the shell is the *cubic* dilation of the label zero set, so "
@@ -653,15 +660,19 @@ def _close(mask: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 def body_mask(t_in: torch.Tensor, t_out: torch.Tensor | None = None,
-              m: torch.Tensor | float = 1.0) -> torch.Tensor:
+              m: torch.Tensor | float = 1.0, mask: torch.Tensor | None = None) -> torch.Tensor:
     """The label sheet *body* (papyrus material) as a 0/1 map.
 
     Two-face target (``t_out`` given): ``(sdf_in > 0) & (sdf_out < 0)`` -- the same definition as
     the ``inside`` mask of :func:`evaluate`'s thickness metric: the body is the slab between the
     two faces, and its thickness is ``sdf_in - sdf_out``.  Body target (``t_out is None``,
     ``surface_mode="body"``): the single channel already *is* ``min(sdf_in, -sdf_out)``
-    (:func:`tsm.data.body_sdf`), so the body is simply ``sdf_body > 0``.  ``m`` restricts it to
-    the supervised voxels."""
+    (:func:`tsm.data.body_sdf`), so the body is simply ``sdf_body > 0``.  ``mask`` given
+    (``surface_mode="sides"``): the body is already a 0/1 target channel
+    (:func:`tsm.data.body_mask_np`) and is used as is, ``t_in`` / ``t_out`` ignored.  ``m``
+    restricts it to the supervised voxels."""
+    if mask is not None:
+        return mask.float() * m
     inside = (t_in > 0) if t_out is None else ((t_in > 0) & (t_out < 0))
     return inside.float() * m
 
@@ -671,13 +682,17 @@ def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int) -> torc
     return _close(body_t, radius) * (1.0 - body_t) * m1
 
 
-def soft_body(p_in: torch.Tensor, p_out: torch.Tensor | None = None, tau: float = 2.0) -> torch.Tensor:
+def soft_body(p_in: torch.Tensor, p_out: torch.Tensor | None = None, tau: float = 2.0,
+              prob: torch.Tensor | None = None) -> torch.Tensor:
     """Differentiable body probability, the soft counterpart of :func:`body_mask`.
 
     Two faces: ``sigmoid(sdf_in / tau) * sigmoid(-sdf_out / tau)`` -- the product of the two
     half-space indicators the hard body mask ANDs.  One body channel (``p_out is None``):
-    ``sigmoid(sdf_body / tau)``.  ``tau`` (voxels, the same scale as :data:`BAND_TAU`) is how
-    sharply the faces cut."""
+    ``sigmoid(sdf_body / tau)``.  ``prob`` given (``surface_mode="sides"``): the head already
+    emits a body *probability*, so it is returned as is and ``tau`` plays no part.  ``tau``
+    (voxels, the same scale as :data:`BAND_TAU`) is how sharply the faces cut."""
+    if prob is not None:
+        return prob
     p = torch.sigmoid(p_in / tau)
     return p if p_out is None else p * torch.sigmoid(-p_out / tau)
 
@@ -708,7 +723,9 @@ def soft_skel(x: torch.Tensor, iters: int) -> torch.Tensor:
 
 def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor | None, t_in: torch.Tensor,
                        t_out: torch.Tensor | None,
-                       mv: torch.Tensor, m1: torch.Tensor, aux: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+                       mv: torch.Tensor, m1: torch.Tensor, aux: Mapping[str, Any],
+                       p_body: torch.Tensor | None = None,
+                       t_body: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Optional *body* terms of ``extra.train.surface_aux`` (``gap``, ``cldice``), both off by default.
 
     Unlike ``shell`` / ``crest`` / ``far`` (:func:`surface_aux_terms`, one face at a time) these
@@ -755,21 +772,25 @@ def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor | None, t_in: tor
     (``sdf_body > 0``) and the soft predicted body (``sigmoid(sdf_body / tau)``) come from the
     single channel -- every term below is otherwise identical.
 
+    In ``surface_mode="sides"`` the body is a head of its own: pass the already-sigmoided body
+    probability as ``p_body`` and the 0/1 label body as ``t_body`` (``tsm.data.body_mask_np``)
+    and neither ``tau`` nor the SDF channels are consulted at all.
+
     Returned values are already multiplied by their weight, so the caller just sums them."""
     out: dict[str, torch.Tensor] = {}
     w_gap, w_cld = float(aux.get("gap", 0.0)), float(aux.get("cldice", 0.0))
     if w_gap <= 0 and w_cld <= 0:
         return out
-    body_t = body_mask(t_in, t_out, mv)          # label side: hard, no gradients
+    body_t = body_mask(t_in, t_out, mv, mask=t_body)   # label side: hard, no gradients
     if w_gap > 0:
         tau = float(aux.get("gap_tau", 2.0))
         gap_m = narrow_gap_mask(body_t, m1, int(aux.get("gap_radius", 3)))
-        out["gap"] = w_gap * per_sample_mean(soft_body(p_in, p_out, tau), gap_m)
+        out["gap"] = w_gap * per_sample_mean(soft_body(p_in, p_out, tau, prob=p_body), gap_m)
     if w_cld > 0:
         iters = int(aux.get("cldice_iters", 5))
         tau = float(aux.get("gap_tau", 2.0))
         t_b = body_t * m1
-        p_b = soft_body(p_in, p_out, tau) * m1
+        p_b = soft_body(p_in, p_out, tau, prob=p_body) * m1
         if float(t_b.sum()) <= 0.0:              # nothing to be topologically right about
             out["cldice"] = torch.zeros((), device=p_in.device, dtype=p_in.dtype)
         else:
@@ -854,6 +875,57 @@ def body_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
         p_sdf = pred[:, 0:1].float()
         out.update(surface_aux_terms(p_sdf, sdf, mv, m1, aux or {}, "body"))
         out.update(surface_body_terms(p_sdf, None, sdf, None, mv, m1, aux or {}))
+    return out
+
+
+def sides_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
+               body: torch.Tensor, weight: torch.Tensor | None = None,
+               aux: Mapping[str, Any] | None = None) -> dict[str, torch.Tensor]:
+    """Orientation-free surface head with the magnitude and the sign **split**
+    (``surface_mode="sides"``): pred = [d_face (raw voxels), body logit, valid logit].
+
+    Targets, both derived on the fly from the same two face labels (no relabelling):
+    ``sdf`` = ``tsm.data.face_dist`` = ``min(|sdf_in|, |sdf_out|)``, the UNSIGNED distance to
+    the nearest face of either kind, and ``body`` = ``tsm.data.body_mask_np`` =
+    ``(sdf_in > 0) & (sdf_out < 0)`` as a 0/1 mask.
+
+    Why the split: the signed body SDF of :func:`body_loss` flips sign twice per sheet and its
+    interior magnitude is the (noisy, 20-70 voxel) half-thickness, so an L1 regression hedges
+    near zero -- measured on the first 30k run, the predicted body SDF had a compressed range
+    (+0.2 median inside sheets against labels of +12..+20) and thresholding at 0 fragmented the
+    bodies.  Here neither half can hedge: the distance is non-negative and single-valued, and
+    the side question is a classification with a Dice term that cares about the *set*.
+
+    Terms: the gaussian-weighted L1 on ``d_face`` (:data:`SDF_WMAX` / :data:`SDF_SIGMA`; the
+    target is >= 0, so the weight peaks exactly on the faces) + :func:`surface_band_dice` on
+    ``exp(-d / tau)`` (sign-agnostic, so it works unchanged on an unsigned field) + BCE and
+    soft Dice on the body logit (as in the ink head) + the valid BCE on ``valid != 2``.  Every
+    term but the valid BCE is masked by ``valid == 1`` (times the optional ``faces_weight``).
+
+    ``aux`` (``extra.train.surface_aux``) adds the zero-set terms of :func:`surface_aux_terms`
+    on the face distance (``shell_face`` / ``crest_face`` / ``far_face``) and the body topology
+    terms of :func:`surface_body_terms` (``gap``, ``cldice``) evaluated on the *predicted body
+    probability* ``sigmoid(body logit)`` and the 0/1 label body."""
+    if pred.shape[1] < 3 or sdf.shape[1] != 1 or body.shape[1] != 1:
+        raise ValueError(f"sides mode needs a 3-channel surface head and 1-channel d_face / body "
+                         f"targets, got {tuple(pred.shape)} / {tuple(sdf.shape)} / {tuple(body.shape)}")
+    p_d, p_b, p_v = pred[:, 0:1].float(), pred[:, 1:2].float(), pred[:, 2:3].float()
+    mv = (valid == 1).float()
+    m1 = _weighted(mv, weight)
+    m_not2 = _weighted((valid != 2).float(), weight)
+    w = 1.0 + SDF_WMAX * torch.exp(-(sdf ** 2) / (2.0 * SDF_SIGMA ** 2))
+    out: dict[str, torch.Tensor] = {
+        "sdf_l1": masked_mean(w * (p_d - sdf).abs(), m1),
+        "band_dice": surface_band_dice(p_d, sdf, m1),
+        "body_bce": masked_mean(F.binary_cross_entropy_with_logits(p_b, body, reduction="none"), m1),
+        "body_dice": soft_dice(torch.sigmoid(p_b), body, m1),
+        "valid_bce": masked_mean(
+            F.binary_cross_entropy_with_logits(p_v, (valid == 1).float(), reduction="none"), m_not2),
+    }
+    if surface_aux_active(aux):
+        out.update(surface_aux_terms(p_d, sdf, mv, m1, aux or {}, "face"))
+        out.update(surface_body_terms(p_b, None, sdf, None, mv, m1, aux or {},
+                                      p_body=torch.sigmoid(p_b), t_body=body))
     return out
 
 
@@ -971,6 +1043,10 @@ def downsample_targets(t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     }
     if "surface_weight" in t:
         out["surface_weight"] = _pool_cont(t["surface_weight"], sv)
+    if "surface_body" in t:
+        # surface_mode="sides": the 0/1 body occupancy pools like ink_prob (mask-aware average
+        # of the mask), while surface_sdf (the face distance) pools like any other SDF above
+        out["surface_body"] = _pool_cont(t["surface_body"], sv)
     if "fiber_valid" in t:
         fv = (t["fiber_valid"] == 1).float()
         out["fiber_valid"] = _pool_mask(t["fiber_valid"])
@@ -1012,6 +1088,8 @@ def compute_losses(
     t: dict[str, torch.Tensor] = {k: batch[k] for k in ("surface_sdf", "surface_valid", "ink_prob", "ink_valid", "winding", "winding_conf", "winding_valid")}
     if "surface_weight" in batch:
         t["surface_weight"] = batch["surface_weight"]
+    if "surface_body" in batch:
+        t["surface_body"] = batch["surface_body"]
     if "fiber" in outs and "fiber_valid" in batch:
         t["fiber_valid"] = batch["fiber_valid"]
         for k in ("fiber_prob", "fiber_dir", "fiber_str", "fiber_weight"):
@@ -1035,6 +1113,12 @@ def compute_losses(
             elif surface_mode == "body":
                 terms["surface"] = body_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
                                              t.get("surface_weight"), aux=surface_aux)
+            elif surface_mode == "sides":
+                if "surface_body" not in t:
+                    raise ValueError("surface_mode='sides' needs the 'surface_body' target "
+                                     "(tsm.data.target_keys('sides'))")
+                terms["surface"] = sides_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
+                                              t["surface_body"], t.get("surface_weight"), aux=surface_aux)
             else:
                 terms["surface"] = surface_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
                                                 t.get("surface_weight"))
@@ -1330,6 +1414,7 @@ def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, 
                     input_radial: bool = False, fiber: bool = False, fiber_mode: str = "class",
                     fiber_band: bool = False, input_axis: bool = False) -> dict[str, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
+    sides = surface_mode == "sides"
     surface_ch = 2 if surface_mode == "faces" else 1
     P = patch
     r = lambda c: torch.rand((batch, c, P, P, P), generator=g)  # noqa: E731
@@ -1348,7 +1433,8 @@ def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, 
         "input": torch.cat(inp, 1),
         "voxel_um": torch.full((batch,), 2.4),
         "origin_zyx": torch.zeros(batch, 3, dtype=torch.int64),
-        "surface_sdf": (r(surface_ch) * 2 - 1) * 20.0,
+        # "sides": surface_sdf is the UNSIGNED face distance, so it is >= 0 by construction
+        "surface_sdf": (r(surface_ch) * 20.0) if sides else ((r(surface_ch) * 2 - 1) * 20.0),
         "surface_valid": (r(1) * 3).floor(),
         "ink_prob": r(1),
         "ink_valid": (r(1) > 0.3).float(),
@@ -1356,6 +1442,8 @@ def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, 
         "winding_conf": r(1),
         "winding_valid": (r(1) * 3).floor(),
     }
+    if sides:
+        b["surface_body"] = (r(1) > 0.5).float()
     if fiber:
         b["fiber_valid"] = (r(1) > 0.3).float()
         if fiber_mode == "direction":
@@ -2255,6 +2343,15 @@ def evaluate(
     ``surface/body_iou``, ``surface/body_vol_ratio`` (predicted / label body voxels) and
     ``surface/body_n_components_ratio`` (26-connected components of at least 32 voxels, the
     per-crop median of pred / label counts); there is no ``thickness_mae`` in body mode.
+    ``surface_mode="sides"`` reports the same block with ``surface/sdf_mae`` measured on the
+    UNSIGNED face distance ``d_face`` (``valid == 1``) and ``surface/zc_dice`` (plus the
+    ``surf_p2t`` / ``surf_t2p`` / ``surf_sym`` distances and the missed / spurious counts)
+    measured on the "zero set" ``d_face <= 1.0`` -- a 2-voxel-thick shell around every face,
+    taken the same way on the prediction and on the label, which is also what the derived
+    ``surface_side1`` channel writes; the body numbers come from the dedicated body head
+    (``sigmoid(body logit) > 0.5``) against the 0/1 label body mask, and the fibre direction
+    basis uses ``sheet_normal(prefer_fallback=True)`` because the gradient of an unsigned
+    distance is degenerate on the ridge.
     Deterministic
     (fixed crop order, no augmentation, eval mode); AUPRC/AUROC use a seeded reservoir of at most
     ``sample_cap`` voxels drawn with equal probability from the whole pooled voxel stream (the
@@ -2279,7 +2376,11 @@ def evaluate(
     band_hit = [0.0, 0.0]  # correct / total human-band voxels
     faces = surface_mode == "faces"
     body = surface_mode == "body"
+    sides = surface_mode == "sides"
     face_names = ("in", "out") if faces else ("",)
+    # the valid logit is the LAST surface channel: index 2 for the 3-wide heads (faces: after
+    # [sdf_in, sdf_out]; sides: after [d_face, body logit]), 1 for the 2-wide ones
+    i_valid = 2 if (faces or sides) else 1
     body_sums = [0.0, 0.0, 0.0]   # |pred & label|, |pred|, |label| body voxels (valid == 1)
     body_comp: list[float] = []   # per-crop ratio of 26-connected component counts
     fib_excl = [0.0, 0.0, 0.0]    # n(both), n(either), n(fiber_valid == 1)
@@ -2315,7 +2416,13 @@ def evaluate(
             sdf_t, sdf_p = b["surface_sdf"][:, fi:fi + 1], out["surface"][:, fi:fi + 1]
             band = m1 & (sdf_t.abs() < float(clip) - 1e-3)
             acc(f"{pre}sdf_mae", (sdf_p - sdf_t).abs(), band.float())
-            zp, zt = zero_crossing(sdf_p, m1), zero_crossing(sdf_t, m1)
+            if sides:
+                # the face distance is UNSIGNED, so it has no zero *crossing*: the "zero set"
+                # scored here is the 2-voxel-thick shell d_face <= 1.0 on both sides, the same
+                # rule the derived `surface_side1` channel writes at inference time
+                zp, zt = (sdf_p <= 1.0) & m1, (sdf_t <= 1.0) & m1
+            else:
+                zp, zt = zero_crossing(sdf_p, m1), zero_crossing(sdf_t, m1)
             zc[fname][0] += float((zp & zt).sum())
             zc[fname][1] += float(zp.sum())
             zc[fname][2] += float(zt.sum())
@@ -2326,10 +2433,16 @@ def evaluate(
                 d_t2p[fname].append(c)
                 missed[fname][0] += int(tn.any() and not pn.any())
                 missed[fname][1] += int(pn.any() and not tn.any())
-        if body:
-            # the orientation-free body: sdf_body > 0 is "this voxel is sheet material"
-            p_b = (out["surface"][:, 0:1] > 0) & m1
-            t_b = (b["surface_sdf"][:, 0:1] > 0) & m1
+        if body or sides:
+            # the orientation-free body.  body mode: sdf_body > 0 is "this voxel is sheet
+            # material"; sides mode: the dedicated body head, sigmoid(logit) > 0.5, against the
+            # 0/1 label mask (tsm.data.body_mask_np)
+            if sides:
+                p_b = (torch.sigmoid(out["surface"][:, 1:2]) > 0.5) & m1
+                t_b = (b["surface_body"][:, 0:1] > 0.5) & m1
+            else:
+                p_b = (out["surface"][:, 0:1] > 0) & m1
+                t_b = (b["surface_sdf"][:, 0:1] > 0) & m1
             body_sums[0] += float((p_b & t_b).sum())
             body_sums[1] += float(p_b.sum())
             body_sums[2] += float(t_b.sum())
@@ -2343,7 +2456,7 @@ def evaluate(
             inside = m1 & (th_t > 0) & (b["surface_sdf"][:, 0:1] > 0) & (b["surface_sdf"][:, 1:2] < 0)
             acc("surface/thickness_mae", (th_p - th_t).abs(), inside.float())
         m_not2 = sv != 2
-        samp["valid"].add(out["surface"][:, len(face_names):len(face_names) + 1][m_not2], m1[m_not2], n)
+        samp["valid"].add(out["surface"][:, i_valid:i_valid + 1][m_not2], m1[m_not2], n)
         # ink
         mi = b["ink_valid"] == 1
         samp["ink"].add(out["ink"][:, 0:1][mi], (b["ink_prob"] > 0.5)[mi], n)
@@ -2360,7 +2473,7 @@ def evaluate(
                 # ``prefer_fallback`` in body mode: grad of a body SDF is degenerate on the
                 # medial ridge, so the winding normal leads there (tsm.fiber.sheet_normal)
                 nrm, _ = sheet_normal(b["surface_sdf"][:, 0:1], b["winding"][:, 3:6].flip(1),
-                                      prefer_fallback=body)
+                                      prefer_fallback=body or sides)
                 tv, th, ok = fiber_basis(nrm, b.get("axis_dir"))
                 dp = F.normalize(fb_out[:, 0:3].float(), dim=1, eps=EPS)
                 sp = torch.sigmoid(fb_out[:, 3:4].float())
@@ -2432,7 +2545,7 @@ def evaluate(
         res.update(_dist_stats(np.concatenate([a, c]), f"{pre}surf_sym"))
         res[f"{pre}missed_surfaces"] = float(missed[fname][0])    # label surface, empty prediction
         res[f"{pre}spurious_surfaces"] = float(missed[fname][1])  # prediction, empty label surface
-    if body:
+    if body or sides:
         inter, npred, nlab = body_sums
         res["surface/body_dice"] = 2.0 * inter / (npred + nlab) if (npred + nlab) > 0 else float("nan")
         union = npred + nlab - inter
