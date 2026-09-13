@@ -120,13 +120,22 @@ N_FIBER_HEAD_CH = 2
 # normal (grad sdf_in) -- so downstream consumers and dev/eval_region.py keep working.
 FIBER_DIR_PRED_CHANNELS = ["fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength"]
 N_FIBER_DIR_HEAD_CH = 4
+# optional Local Shape Descriptor head (extra.train.heads.lsd, sides mode; tsm.data.lsd_targets):
+# the offset to the sheet centre plane (a signed vector, encoded like a normal but scaled by
+# 2*clip so the +-clip range fits), the windowed sheet thickness (a voxel count) and the
+# windowed normal incoherence (a probability).  Appended after the fibre head channels, so the
+# head channels stay contiguous and an older store is a prefix of a newer one up to `spare`.
+LSD_PRED_CHANNELS = ["lsd_off_z", "lsd_off_y", "lsd_off_x", "lsd_thick", "lsd_ncov"]
+N_LSD_HEAD_CH = 5
 
 
 def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
-                  gap_class: bool = False) -> list[str]:
+                  gap_class: bool = False, lsd: bool = False) -> list[str]:
     """Channel names of pred.zarr for a mode.  ``gap_class`` (sides mode, a checkpoint trained
     with ``extra.train.surface_aux.gap_class > 0``) inserts the extra head channel ``gap``
-    right after ``valid``; without it the layout is the historical one."""
+    right after ``valid``; ``lsd`` (sides mode, ``extra.train.heads.lsd``) appends the five
+    Local Shape Descriptor channels after the other head channels; without either the layout is
+    the historical one."""
     base = {"faces": FACE_PRED_CHANNELS, "body": BODY_PRED_CHANNELS,
             "sides": SIDES_PRED_CHANNELS}.get(surface_mode, PRED_CHANNELS)
     base = list(base)
@@ -134,23 +143,33 @@ def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode:
         if surface_mode != "sides":
             raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
         base.insert(base.index("valid") + 1, "gap")
+    if lsd and surface_mode != "sides":
+        raise ValueError(f"heads.lsd needs surface_mode='sides', got {surface_mode!r}")
+    extra = list(LSD_PRED_CHANNELS) if lsd else []
     if not fiber:
-        return base
+        if not extra:
+            return base
+        cut = base.index("spare") + 1
+        return base[:cut] + extra + base[cut:]
     cut = base.index("spare") + 1  # the derived (non-head) channels follow `spare`
     if fiber_mode == "direction":
         # head channels stay contiguous; the derived vt/hz go last, with surface1 / thickness
-        return base[:cut] + list(FIBER_DIR_PRED_CHANNELS) + base[cut:] + list(FIBER_PRED_CHANNELS)
-    return base[:cut] + list(FIBER_PRED_CHANNELS) + base[cut:]
+        return base[:cut] + list(FIBER_DIR_PRED_CHANNELS) + extra + base[cut:] + list(FIBER_PRED_CHANNELS)
+    return base[:cut] + list(FIBER_PRED_CHANNELS) + extra + base[cut:]
 
 
 def n_head_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
-              gap_class: bool = False) -> int:
+              gap_class: bool = False, lsd: bool = False) -> int:
     n = {"faces": N_FACE_HEAD_CH, "body": N_BODY_HEAD_CH,
          "sides": N_SIDES_HEAD_CH}.get(surface_mode, N_HEAD_CH)
     if gap_class:
         if surface_mode != "sides":
             raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
         n += 1
+    if lsd:
+        if surface_mode != "sides":
+            raise ValueError(f"heads.lsd needs surface_mode='sides', got {surface_mode!r}")
+        n += N_LSD_HEAD_CH
     if not fiber:
         return n
     return n + (N_FIBER_DIR_HEAD_CH if fiber_mode == "direction" else N_FIBER_HEAD_CH)
@@ -268,6 +287,28 @@ def checkpoint_gap_class(cfgb: dict[str, Any]) -> bool:
     return float((tb.get("surface_aux") or {}).get("gap_class", 0.0) or 0.0) > 0.0
 
 
+def checkpoint_lsd(cfgb: dict[str, Any]) -> bool:
+    """True when a checkpoint's config blob says the student carries the Local Shape Descriptor
+    head.  Written as a top-level ``lsd`` flag by :func:`tsm.train.run_train`; for a blob that
+    predates it (every checkpoint before the head existed) it falls back to
+    ``train.heads.lsd``, i.e. False."""
+    tb = cfgb.get("train") or {}
+    if "lsd" in cfgb:
+        return bool(cfgb["lsd"])
+    return bool((cfgb.get("heads") or tb.get("heads") or {}).get("lsd", False))
+
+
+def _checkpoint_lsd(ckpt: str) -> bool:
+    """:func:`checkpoint_lsd` read straight off a checkpoint path (False when unreadable)."""
+    if not os.path.exists(ckpt):
+        return False
+    try:
+        cfgb = torch.load(ckpt, map_location="cpu", weights_only=False).get("config") or {}
+    except Exception:
+        return False
+    return checkpoint_lsd(cfgb)
+
+
 def _checkpoint_gap_class(ckpt: str) -> bool:
     """:func:`checkpoint_gap_class` read straight off a checkpoint path (False when unreadable)."""
     if not os.path.exists(ckpt):
@@ -328,11 +369,16 @@ def activate_heads(out: dict[str, torch.Tensor], surface_mode: str = "medial",
             parts += [F.normalize(f[:, 0:3], dim=1, eps=1e-6), torch.sigmoid(f[:, 3:4])]
         else:  # [vt, hz] probabilities, appended after `spare`
             parts.append(torch.sigmoid(f[:, 0:2]))
+    if "lsd" in out:
+        # [off_z, off_y, off_x] stay raw (voxels, signed), the thickness is relu'd (the target
+        # is >= 0) and the normal incoherence is a probability
+        l = out["lsd"].float()
+        parts += [l[:, 0:3], torch.relu(l[:, 3:4]), torch.sigmoid(l[:, 4:5])]
     return torch.cat(parts, dim=1)
 
 
 def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
-            fiber_mode: str = "class", gap_class: bool = False) -> torch.Tensor:
+            fiber_mode: str = "class", gap_class: bool = False, lsd: bool = False) -> torch.Tensor:
     """(B, 11 | 12, ...) physical values -> [0, 1] so that round(u*255) is the label-store byte.
 
     sdf -> (128 + clip(sdf)*127/clip)/255 (bytes 1..255, 0 stays "no data"); in the two-face mode
@@ -356,10 +402,21 @@ def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
         o = ns - 1
         head = [(128.0 + phys[:, 0:ns].clamp(-clip, clip) * (127.0 / clip)) / 255.0,
                 phys[:, 1 + o:3 + o]]
-    tail = phys[:, 9 + o:]  # conf, spare, then the fibre head
+    tail = phys[:, 9 + o:]  # conf, spare, then the fibre head, then the lsd head
+    n_lsd = 5 if lsd else 0
+    if n_lsd:
+        # the last 5 channels: the offset VECTOR (voxels, |off| <= clip) encoded like a signed
+        # [-1, 1] channel after dividing by 2*clip, the thickness as a plain voxel COUNT byte
+        # (the same encoding as the two-face `thickness` channel) and the incoherence as a
+        # probability
+        ls = tail[:, tail.shape[1] - n_lsd:]
+        ls = torch.cat([signed(ls[:, 0:3] / (2.0 * clip)), ls[:, 3:4] / 255.0, ls[:, 4:5]], dim=1)
+        tail = tail[:, : tail.shape[1] - n_lsd]
     if fiber_mode == "direction" and tail.shape[1] >= 6:
         # [conf, spare, dz, dy, dx, strength]: the direction is signed like a normal
         tail = torch.cat([tail[:, 0:2], signed(tail[:, 2:5]), tail[:, 5:]], dim=1)
+    if n_lsd:
+        tail = torch.cat([tail, ls], dim=1)
     u = torch.cat(
         head + [signed(phys[:, 3 + o:5 + o]), phys[:, 5 + o:6 + o] * (GRAD_MAG_ENCODE_SCALE / 255.0),
                 signed(phys[:, 6 + o:9 + o]), tail], dim=1,
@@ -392,9 +449,16 @@ def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHAN
         alias = next((k for k in ("sdf_in", "sdf_body", "d_face") if k in out), None)
         if alias is not None:
             out["sdf"] = out[alias]
-    for k in ("valid", "body", "gap", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength"):
+    for k in ("valid", "body", "gap", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength",
+              "lsd_ncov"):
         if k in ch:
             out[k] = decode_prob(ch[k])
+    for k in ("lsd_off_z", "lsd_off_y", "lsd_off_x"):
+        # the LSD offset is a signed [-2*clip, 2*clip] length in voxels (tsm.data.lsd_targets)
+        if k in ch:
+            out[k] = decode_signed(ch[k]) * (2.0 * clip)
+    if "lsd_thick" in ch:
+        out["lsd_thick"] = ch["lsd_thick"].astype(np.float32)
     for k in ("fiber_dz", "fiber_dy", "fiber_dx"):
         if k in ch:
             out[k] = decode_signed(ch[k])
@@ -487,6 +551,16 @@ def tta_inverse(out: dict[str, torch.Tensor], axes: Sequence[int], transpose: bo
                 sign[2 - a] = -1.0  # spatial axis a (z, y, x) <-> component (nz, ny, nx)
             n = n * sign.view(1, 3, 1, 1, 1)
             v = torch.cat([v[:, :3], n, v[:, 6:]], dim=1)
+        elif k == "lsd" and v.shape[1] >= 5:
+            # [off_z, off_y, off_x, thick, ncov]: the offset is a (z, y, x) vector (the two
+            # scalars are a length and a rotation invariant, so they only move with the grid)
+            d = v[:, 0:3]
+            if transpose:
+                d = d[:, [0, 2, 1]]
+            sign = torch.ones(3, device=v.device, dtype=v.dtype)
+            for a in axes:
+                sign[a] = -1.0
+            v = torch.cat([d * sign.view(1, 3, 1, 1, 1), v[:, 3:]], dim=1)
         elif k == "fiber" and v.shape[1] >= 4:
             # the direction head [dz, dy, dx, strength] is a (z, y, x) vector; the strength and
             # the two class logits of the other mode are scalars and move with the grid alone
@@ -511,7 +585,7 @@ class StudentNet(nn.Module):
     def __init__(self, net: nn.Module, voxel_um: float, clip: float, tta: str | bool = "none",
                  surface_mode: str = "medial", input_radial: bool = False, axis: Any = None,
                  input_axis: bool = False, fiber_mode: str = "class",
-                 axis_tangent: bool = True, gap_class: bool = False) -> None:
+                 axis_tangent: bool = True, gap_class: bool = False, lsd: bool = False) -> None:
         super().__init__()
         self.net = net
         self.scale = float(scale_channel_value(voxel_um))
@@ -527,6 +601,8 @@ class StudentNet(nn.Module):
         self.fiber_mode = str(fiber_mode)
         # surface_mode "sides" trained with surface_aux.gap_class: one more head channel (`gap`)
         self.gap_class = bool(gap_class)
+        # extra.train.heads.lsd: five more head channels (the Local Shape Descriptors)
+        self.lsd = bool(lsd)
         # sliding.predict_box hands the absolute origin of every window to a net that asks for it
         self.needs_box_origin = self.input_radial or self.input_axis
         self.axis = None
@@ -589,7 +665,7 @@ class StudentNet(nn.Module):
 
     def forward(self, x: torch.Tensor, box_origin_zyx: Any = None) -> torch.Tensor:
         phys = activate_heads(self.raw(x, box_origin_zyx), self.surface_mode, self.fiber_mode)
-        return to_unit(phys, self.clip, self.surface_mode, self.fiber_mode, self.gap_class)
+        return to_unit(phys, self.clip, self.surface_mode, self.fiber_mode, self.gap_class, self.lsd)
 
 
 def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) -> dict[str, Any]:
@@ -617,6 +693,9 @@ def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) 
         # the extra sides head channel of extra.train.surface_aux.gap_class; absent (False) in
         # every checkpoint written before it existed, so those still build a 3-channel head
         "gap_class": checkpoint_gap_class(cfgb),
+        # ... and the optional Local Shape Descriptor head, likewise absent from every older
+        # checkpoint (so those build exactly the head set they were trained with)
+        "lsd": checkpoint_lsd(cfgb),
     }
 
 
@@ -693,7 +772,7 @@ def load_student(path: str, device: str | torch.device = "cpu", widths: Sequence
                    "in_ch": in_channels(radial, ax_in), "input_channels": input_channels(radial, ax_in),
                    "body_stride": kw["body_stride"], "fullres_width": kw["fullres_width"], "norm": kw["norm"],
                    "fiber": bool(kw["fiber"]), "fiber_mode": str(kw["fiber_mode"]),
-                   "gap_class": bool(kw["gap_class"]),
+                   "gap_class": bool(kw["gap_class"]), "lsd": bool(kw["lsd"]),
                    "rf_radius": int(model.receptive_field_radius())}
 
 
@@ -971,8 +1050,12 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
     fiber = _checkpoint_fiber(ckpt)
     fmode = _checkpoint_fiber_mode(ckpt)
     gap_cls = _checkpoint_gap_class(ckpt)
-    channels = pred_channels(smode, fiber, fmode, gap_cls)
-    nhead = n_head_ch(smode, fiber, fmode, gap_cls)
+    lsd_on = _checkpoint_lsd(ckpt)
+    channels = pred_channels(smode, fiber, fmode, gap_cls, lsd_on)
+    nhead = n_head_ch(smode, fiber, fmode, gap_cls, lsd_on)
+    if lsd_on:
+        print(f"[infer] student trained with heads.lsd: writing the Local Shape Descriptor "
+              f"channels {LSD_PRED_CHANNELS}", flush=True)
     if gap_cls:
         print("[infer] sides head trained with surface_aux.gap_class: writing the extra `gap` "
               "channel (P(this voxel is the air gap between two sheets))", flush=True)
@@ -1039,7 +1122,8 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
                      input_axis=bool(info.get("input_axis", False)),
                      axis_tangent=bool(info.get("axis_tangent", False)),
                      fiber_mode=str(info.get("fiber_mode", fmode)),
-                     gap_class=bool(info.get("gap_class", gap_cls))).to(device)
+                     gap_class=bool(info.get("gap_class", gap_cls)),
+                     lsd=bool(info.get("lsd", lsd_on))).to(device)
     print(f"[infer] loaded {info} in {time.perf_counter() - t:.1f}s, params={model.num_params() / 1e6:.2f}M", flush=True)
     reader = open_ct(cfg, 0, int(opts["probe_brick"]))
     writer = BrickWriter(pred_path, channels, region.size_zyx, chunk=int(opts["chunk"]),
@@ -1081,6 +1165,10 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
             "gap": ("sigmoid * 255: P(this voxel is the thin air gap between two sheets) "
                     "(sides mode, surface_aux.gap_class)"),
             "surface_side1": "255 where d_face <= 1 and valid >= 0.5 (sides mode)",
+            "lsd_off_z|lsd_off_y|lsd_off_x": (f"127.5 + 127.5 * off/(2*{clip:g}): the offset (voxels) to "
+                                              f"the centre plane of the voxel's own sheet (heads.lsd)"),
+            "lsd_thick": "round(clip(thickness, 0, 255)) voxels, the windowed sheet thickness (heads.lsd)",
+            "lsd_ncov": "sigmoid * 255: windowed normal incoherence, 0 = flat coherent sheet (heads.lsd)",
             "thickness": "round(clip(sdf_in - sdf_out, 0, 255)) voxels (two-face mode)",
         },
         "peak_rss_mb": peak_rss_mb(),

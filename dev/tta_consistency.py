@@ -220,7 +220,8 @@ def run(config: str, crops: int = DEFAULT_CROPS, tta: str = "flip8_rot4", checkp
                     input_radial=bool(info.get("input_radial", False)),
                     axis=info.get("axis_path"), input_axis=bool(info.get("input_axis", False)),
                     axis_tangent=bool(info.get("axis_tangent", False)), fiber_mode=fmode,
-                    gap_class=bool(info.get("gap_class", False))).to(dev)
+                    gap_class=bool(info.get("gap_class", False)),
+                    lsd=bool(info.get("lsd", False))).to(dev)
     log(f"student {os.path.basename(ckpt)} step {info.get('step')}: surface_mode={smode} "
         f"fiber_mode={fmode} input_radial={info.get('input_radial')} input_axis={info.get('input_axis')}")
 

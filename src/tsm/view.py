@@ -118,6 +118,9 @@ _PROB = (
     # surface_mode "sides": the sheet-body probability head, and the optional air-gap head
     # of extra.train.surface_aux.gap_class
     "body", "gap",
+    # the Local Shape Descriptor head (extra.train.heads.lsd): the normal incoherence is a
+    # [0, 1] scalar (0 = flat coherent sheet)
+    "lsd_ncov",
 )
 #: signed [-1, 1] scalars that are not part of a vector
 _SIGNED = ("sin", "cos", "phase_sin", "phase_cos", "grad_mag")
@@ -125,6 +128,8 @@ _SIGNED = ("sin", "cos", "phase_sin", "phase_cos", "grad_mag")
 _VEC = {
     "nx": ("normal", 0), "ny": ("normal", 1), "nz": ("normal", 2),
     "fiber_dx": ("fiber_dir", 0), "fiber_dy": ("fiber_dir", 1), "fiber_dz": ("fiber_dir", 2),
+    # the LSD offset to the sheet centre plane (signed, scaled by 2*clip at write time)
+    "lsd_off_x": ("lsd_off", 0), "lsd_off_y": ("lsd_off", 1), "lsd_off_z": ("lsd_off", 2),
 }
 #: signed-distance channels (kind ``sdf``, ``clip`` required)
 #: ``d_face`` (surface_mode "sides") is UNSIGNED but carries the same byte encoding, so the
@@ -160,7 +165,7 @@ def layer_for(channel: str, group: str, clip: float = CLIP, name: str | None = N
         return Layer(nm, group, "class", palette=_CLASS[ch])
     if ch == "density":
         return Layer(nm, group, "density")
-    if ch == "thickness":
+    if ch in ("thickness", "lsd_thick"):
         return Layer(nm, group, "count")
     if ch in _PROB:
         return Layer(nm, group, "prob")
@@ -359,7 +364,7 @@ class StudentSource(Source):
         import torch
 
         from tsm.infer import (INFER_DEFAULTS, _checkpoint_fiber, _checkpoint_fiber_mode,
-                               _checkpoint_gap_class, _checkpoint_surface_mode, StudentNet,
+                               _checkpoint_gap_class, _checkpoint_lsd, _checkpoint_surface_mode, StudentNet,
                                load_student, n_head_ch, pred_channels, tta_transforms)
         from tsm.sliding import WindowSpec
 
@@ -379,8 +384,9 @@ class StudentSource(Source):
         smode = _checkpoint_surface_mode(self.checkpoint)
         fiber, fmode = _checkpoint_fiber(self.checkpoint), _checkpoint_fiber_mode(self.checkpoint)
         gap_cls = _checkpoint_gap_class(self.checkpoint)
-        self.channels = pred_channels(smode, fiber, fmode, gap_cls)
-        self.n_head = n_head_ch(smode, fiber, fmode, gap_cls)
+        lsd_on = _checkpoint_lsd(self.checkpoint)
+        self.channels = pred_channels(smode, fiber, fmode, gap_cls, lsd_on)
+        self.n_head = n_head_ch(smode, fiber, fmode, gap_cls, lsd_on)
         self.surface_mode = smode
         t0 = time.perf_counter()
         model, info = load_student(self.checkpoint, "cuda")
@@ -392,7 +398,8 @@ class StudentSource(Source):
                               axis=info.get("axis_path"), input_axis=bool(info.get("input_axis", False)),
                               axis_tangent=bool(info.get("axis_tangent", False)),
                               fiber_mode=str(info.get("fiber_mode", fmode)),
-                              gap_class=bool(info.get("gap_class", gap_cls))).to("cuda")
+                              gap_class=bool(info.get("gap_class", gap_cls)),
+                              lsd=bool(info.get("lsd", lsd_on))).to("cuda")
         self.spec = WindowSpec(patch=int(patch), step=int(patch) // 2, out_tile=int(out_tile),
                                halo=None, batch=int(batch), tta=False, dtype=torch.bfloat16,
                                norm_scope="window", prefetch=False)

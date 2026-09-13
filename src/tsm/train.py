@@ -151,8 +151,11 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     "balance_every": 50,     # gradnorm_lite: measure the per-head gradient norms every N steps
     "grad_log_every": 100,   # log gradnorm/<head> every N steps (0 = never), any balance mode
     # optional heads: {"fiber": true} adds the 2-channel fibre-orientation head (needs a fine
-    # store built with the fiber_vt / fiber_hz / fiber_valid channels)
-    "heads": {"fiber": False},
+    # store built with the fiber_vt / fiber_hz / fiber_valid channels); {"lsd": true} adds the
+    # 5-channel Local Shape Descriptor head ("sides" mode only, tsm.data.lsd_targets)
+    "heads": {"fiber": False, "lsd": False},
+    # gaussian window (voxels) of the Local Shape Descriptors
+    "lsd_sigma": 6.0,  # = tsm.data.LSD_SIGMA
     # fibre target encoding (tsm.fiber): "direction" (default: an axial fibre direction +
     # strength derived on the fly against the local axis tangent; a 4-channel head) or "class"
     # (legacy ablation: the two axis-relative probabilities, swapped by an augmentation that
@@ -286,6 +289,15 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
         raise ValueError(f"unknown extra.train.heads keys: {unknown_h} (known: {sorted(hd)})")
     hd.update({k: bool(v) for k, v in raw_heads.items()})
     opts["heads"] = hd
+    if float(opts["lsd_sigma"]) <= 0:
+        raise ValueError(f"extra.train.lsd_sigma must be > 0, got {opts['lsd_sigma']!r}")
+    if hd["lsd"]:
+        if str(opts["surface_mode"]) != "sides":
+            raise ValueError("extra.train.heads.lsd needs extra.train.surface_mode='sides', got "
+                             f"{opts['surface_mode']!r}")
+        # the head's default weight, only when it is actually built (so a run without it keeps
+        # exactly the historical loss_weights, and the balancer keeps the historical head set)
+        opts["loss_weights"].setdefault("lsd", 1.0)
     pw = opts.get("ink_pos_weight", "auto")
     if not (pw in (None, "auto") or isinstance(pw, (int, float))):
         raise ValueError(f"extra.train.ink_pos_weight must be 'auto', a number or null, got {pw!r}")
@@ -1172,6 +1184,31 @@ def fiber_dir_loss(pred: torch.Tensor, d: torch.Tensor, strength: torch.Tensor, 
     return {"dir_cos": dcos, "str_bce": sbce}
 
 
+def lsd_loss(pred: torch.Tensor, lsd: torch.Tensor, valid: torch.Tensor,
+             clip: float = 20.0) -> dict[str, torch.Tensor]:  # clip = tsm.data.CLIP
+    """Local Shape Descriptor loss (``extra.train.heads.lsd``, :func:`tsm.data.lsd_targets`).
+
+    ``pred`` is the 5-channel head ``[off_z, off_y, off_x, thick, ncov logit]`` and ``lsd`` the
+    matching target; everything is masked by ``lsd_valid == 1`` (the label body).  Masked L1 on
+    all five channels, per-channel scale-normalised so the three terms are O(1) and comparable:
+
+    * ``off_l1``   -- the offset to the sheet centre plane, in voxels / ``clip``;
+    * ``thick_l1`` -- the windowed sheet thickness, in voxels / ``clip``;
+    * ``ncov_l1``  -- the windowed normal incoherence; the head channel is a logit, so the
+      comparison is against ``sigmoid(pred)``, which is also what inference writes.
+    """
+    if pred.shape[1] < 5 or lsd.shape[1] != 5:
+        raise ValueError(f"lsd needs a 5-channel head and a 5-channel target, got "
+                         f"{tuple(pred.shape)} / {tuple(lsd.shape)}")
+    p, t = pred.float(), lsd.float()
+    m = (valid == 1).float()
+    inv = 1.0 / float(clip)
+    off = masked_mean((p[:, 0:3] - t[:, 0:3]).abs().mean(dim=1, keepdim=True) * inv, m)
+    thick = masked_mean((p[:, 3:4] - t[:, 3:4]).abs() * inv, m)
+    ncov = masked_mean((torch.sigmoid(p[:, 4:5]) - t[:, 4:5]).abs(), m)
+    return {"off_l1": off, "thick_l1": thick, "ncov_l1": ncov}
+
+
 def winding_loss(pred: torch.Tensor, w: torch.Tensor, conf: torch.Tensor, valid: torch.Tensor) -> dict[str, torch.Tensor]:
     pred = pred.float()
     m1 = (valid == 1).float()
@@ -1218,6 +1255,12 @@ def downsample_targets(t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # surface_mode="sides": the 0/1 body occupancy pools like ink_prob (mask-aware average
         # of the mask), while surface_sdf (the face distance) pools like any other SDF above
         out["surface_body"] = _pool_cont(t["surface_body"], sv)
+    if "lsd" in t:
+        # the descriptors live on their own (body) mask: masked average, mask by decimation.
+        # Like surface_sdf, the two length channels stay in FINE voxels at every level.
+        lv = (t["lsd_valid"] == 1).float()
+        out["lsd"] = _pool_cont(t["lsd"], lv)
+        out["lsd_valid"] = _pool_mask(t["lsd_valid"])
     if "fiber_valid" in t:
         fv = (t["fiber_valid"] == 1).float()
         out["fiber_valid"] = _pool_mask(t["fiber_valid"])
@@ -1261,6 +1304,8 @@ def compute_losses(
         t["surface_weight"] = batch["surface_weight"]
     if "surface_body" in batch:
         t["surface_body"] = batch["surface_body"]
+    if "lsd" in outs and "lsd" in batch:
+        t["lsd"], t["lsd_valid"] = batch["lsd"], batch["lsd_valid"]
     if "fiber" in outs and "fiber_valid" in batch:
         t["fiber_valid"] = batch["fiber_valid"]
         for k in ("fiber_prob", "fiber_dir", "fiber_str", "fiber_weight"):
@@ -1297,6 +1342,8 @@ def compute_losses(
             terms["ink"] = ink_loss(outs["ink"][lvl], t["ink_prob"], t["ink_valid"], pos_weight=pw)
         if "winding" in outs:
             terms["winding"] = winding_loss(outs["winding"][lvl], t["winding"], t["winding_conf"], t["winding_valid"])
+        if "lsd" in outs and "lsd" in t:
+            terms["lsd"] = lsd_loss(outs["lsd"][lvl], t["lsd"], t["lsd_valid"])
         if "fiber" in outs and "fiber_valid" in t:
             if "fiber_dir" in t:  # fiber_mode "direction": [dz, dy, dx, strength]
                 terms["fiber"] = fiber_dir_loss(outs["fiber"][lvl], t["fiber_dir"], t["fiber_str"],
@@ -1583,7 +1630,8 @@ SYNTH_AXIS = (1.0, 0.3, -0.2)
 
 def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, surface_mode: str = "medial",
                     input_radial: bool = False, fiber: bool = False, fiber_mode: str = "class",
-                    fiber_band: bool = False, input_axis: bool = False) -> dict[str, torch.Tensor]:
+                    fiber_band: bool = False, input_axis: bool = False,
+                    lsd: bool = False) -> dict[str, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     sides = surface_mode == "sides"
     surface_ch = 2 if surface_mode == "faces" else 1
@@ -1615,6 +1663,11 @@ def synthetic_batch(batch: int, patch: int, device: str = "cpu", seed: int = 0, 
     }
     if sides:
         b["surface_body"] = (r(1) > 0.5).float()
+    if lsd:
+        # [off_z, off_y, off_x] (voxels, |off| <= clip), thickness (voxels) and the [0, 1]
+        # normal incoherence, on the label-body mask
+        b["lsd"] = torch.cat([(r(3) * 2 - 1) * 10.0, r(1) * 40.0, r(1)], 1)
+        b["lsd_valid"] = (r(1) > 0.5).float()
     if fiber:
         b["fiber_valid"] = (r(1) > 0.3).float()
         if fiber_mode == "direction":
@@ -1931,6 +1984,8 @@ def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], aug
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
         axis_tangent=bool(opts.get("axis_tangent", True)),
         body_ct_gate=opts.get("body_ct_gate"),
+        lsd=bool((opts.get("heads") or {}).get("lsd", False)),
+        lsd_sigma=float(opts.get("lsd_sigma", 6.0)),
     )
     return ds, train_o, hold_o
 
@@ -2021,6 +2076,8 @@ def build_dataset(cfg: RunCfg, opts: dict[str, Any], augment: bool = True):
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
         axis_tangent=bool(opts.get("axis_tangent", True)),
         body_ct_gate=opts.get("body_ct_gate"),
+        lsd=bool((opts.get("heads") or {}).get("lsd", False)),
+        lsd_sigma=float(opts.get("lsd_sigma", 6.0)),
     )
     ds.holdout_origins = hold_o
     print(f"[tsm] {len(ds.origins)} crop origins (patch {ds.patch}, stride {opts['stride']}, coarse factor {ds.factor}), "
@@ -2057,7 +2114,8 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     fmode = str(opts["fiber_mode"])
     # extra.train.surface_aux.gap_class > 0 widens the sides surface head by one channel
     gap_cls = float((opts.get("surface_aux") or {}).get("gap_class", 0.0)) > 0
-    heads = heads_for(smode, do_fiber, fmode, gap_cls)
+    do_lsd = bool(opts["heads"]["lsd"])
+    heads = heads_for(smode, do_fiber, fmode, gap_cls, do_lsd)
     radial = bool(opts["input_radial"])
     ax_in = bool(opts["input_axis"])
     ax_tan = bool(opts["axis_tangent"])
@@ -2065,7 +2123,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     model = build_model(widths=widths, in_ch=n_in, compile=bool(opts["compile"]), act_ckpt=int(opts["act_ckpt"]),
                         channels_last=cl, surface_mode=smode, body_stride=int(opts["body_stride"]),
                         fullres_width=int(opts["fullres_width"]), norm=str(opts["norm"]), fiber=do_fiber,
-                        fiber_mode=fmode, gap_class=gap_cls).to(device)
+                        fiber_mode=fmode, gap_class=gap_cls, lsd=do_lsd).to(device)
     n_params = _unwrap(model).num_params()
     print(f"[tsm] TSMNet widths={widths} params={n_params / 1e6:.2f}M surface_mode={smode} heads={heads} "
           f"in_ch={n_in} {input_channels(radial, ax_in)} device={device} channels_last={cl} "
@@ -2076,10 +2134,15 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     if ax_in:
         print(f"[tsm] input_axis: the scroll-axis direction (a_z, a_y, a_x) as input channels "
               f"({'local umbilicus tangent' if ax_tan else 'constant (1, 0, 0)'})", flush=True)
+    if do_lsd:
+        from tsm.data import LSD_CHANNELS
+
+        print(f"[tsm] heads.lsd: Local Shape Descriptors {LSD_CHANNELS} "
+              f"(gaussian window sigma {float(opts['lsd_sigma']):g} voxels)", flush=True)
     if do_fiber:
         print(f"[tsm] fiber_mode={fmode}" + ("" if fmode == "direction" else
               f" (class swap under axis-moving transforms: {bool(opts['fiber_swap_fix'])})"), flush=True)
-    items_bytes = (n_in + sum(_target_ch(smode, do_fiber, fmode, True))) * P ** 3 * 4
+    items_bytes = (n_in + sum(_target_ch(smode, do_fiber, fmode, True, do_lsd))) * P ** 3 * 4
     print("[tsm] RAM:", flush=True)
     estimate_and_assert(
         [("loader prefetch (RAM)", (max(1, int(opts["num_workers"])) * 2 * B, items_bytes // 4), np.float32)], cfg.budget
@@ -2111,7 +2174,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     if dry_run:
         model.train()
         batch = synthetic_batch(B, P, device, surface_mode=smode, input_radial=radial, fiber=do_fiber,
-                                fiber_mode=fmode, input_axis=ax_in)
+                                fiber_mode=fmode, input_axis=ax_in, lsd=do_lsd)
         aug_mode, aug_spec = augment_mode(opts)
         aug_dt = 0.0
         if aug_mode == "v2":
@@ -2184,7 +2247,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
                    "body_stride": int(opts["body_stride"]), "fullres_width": int(opts["fullres_width"]),
                    "norm": str(opts["norm"]),
                    "input_radial": radial, "input_axis": ax_in, "axis_tangent": ax_tan, "fiber_mode": fmode,
-                   "gap_class": gap_cls,
+                   "gap_class": gap_cls, "lsd": do_lsd,
                    "in_ch": n_in, "axis_path": opts["axis_path"], "region": [list(cfg.region.start_zyx), list(cfg.region.size_zyx)], "volume": cfg.volume.__dict__}
 
     aug_mode, aug_spec = augment_mode(opts)
@@ -2514,7 +2577,10 @@ def evaluate(
     ``fiber/band_angle_deg`` and ``fiber/band_class_acc``; both modes also report the class
     **exclusivity** ``fiber/overlap_frac`` = n(vt > .5 & hz > .5) / n(vt > .5 | hz > .5) and
     ``fiber/firing_frac`` = n(vt > .5 | hz > .5) / n(fiber_valid == 1), on the (derived) class
-    probabilities.  ``surface_mode="body"`` goes through the single-face branch (sdf MAE, zc
+    probabilities.  With the optional Local Shape Descriptor head (``extra.train.heads.lsd``)
+    it also reports, on ``lsd_valid == 1`` and in the descriptors' own units,
+    ``lsd/off_mae`` (voxels, the mean over the three offset components), ``lsd/thick_mae``
+    (voxels) and ``lsd/ncov_mae`` ([0, 1], against ``sigmoid`` of the head).  ``surface_mode="body"`` goes through the single-face branch (sdf MAE, zc
     Dice, distances, missed / spurious, valid AUPRC) and adds ``surface/body_dice``,
     ``surface/body_iou``, ``surface/body_vol_ratio`` (predicted / label body voxels) and
     ``surface/body_n_components_ratio`` (26-connected components of at least 32 voxels, the
@@ -2631,6 +2697,15 @@ def evaluate(
             th_t = b["surface_sdf"][:, 0:1] - b["surface_sdf"][:, 1:2]
             inside = m1 & (th_t > 0) & (b["surface_sdf"][:, 0:1] > 0) & (b["surface_sdf"][:, 1:2] < 0)
             acc("surface/thickness_mae", (th_p - th_t).abs(), inside.float())
+        if "lsd" in out and "lsd" in b:
+            # Local Shape Descriptors, on the label body (lsd_valid == 1): the mean absolute
+            # error of each descriptor in its OWN units (voxels / voxels / [0, 1]), not the
+            # scale-normalised loss
+            ml = (b["lsd_valid"] == 1).float()
+            pl, tl = out["lsd"].float(), b["lsd"].float()
+            acc("lsd/off_mae", (pl[:, 0:3] - tl[:, 0:3]).abs().mean(dim=1, keepdim=True), ml)
+            acc("lsd/thick_mae", (pl[:, 3:4] - tl[:, 3:4]).abs(), ml)
+            acc("lsd/ncov_mae", (torch.sigmoid(pl[:, 4:5]) - tl[:, 4:5]).abs(), ml)
         m_not2 = sv != 2
         samp["valid"].add(out["surface"][:, i_valid:i_valid + 1][m_not2], m1[m_not2], n)
         # ink
@@ -2764,7 +2839,7 @@ def feat_teacher_loader(name: str, models_dir: str, device: str = "cpu", dtype: 
 
 
 def _target_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
-               band: bool = False) -> list[int]:
+               band: bool = False, lsd: bool = False) -> list[int]:
     from tsm.data import target_keys
 
-    return list(target_keys(surface_mode, fiber, fiber_mode, band).values())
+    return list(target_keys(surface_mode, fiber, fiber_mode, band, lsd=lsd).values())

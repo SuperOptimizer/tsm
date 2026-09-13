@@ -244,7 +244,7 @@ def test_student_rf_radius_and_build_kw(tmp_path):
     kw = student_build_kw({"widths": list(widths), "body_stride": 2, "fullres_width": 16, "norm": "batch"})
     assert kw == {"widths": widths, "surface_mode": "medial", "in_ch": 2, "body_stride": 2,
                   "fullres_width": 16, "norm": "batch", "fiber": False, "fiber_mode": "class",
-                  "gap_class": False}
+                  "gap_class": False, "lsd": False}
     # a checkpoint from before these options existed builds the full-resolution GroupNorm student
     old = student_build_kw({"train": {"widths": list(widths), "input_radial": True}})
     assert old["body_stride"] == 1 and old["norm"] == "group" and old["in_ch"] == 5

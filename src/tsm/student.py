@@ -74,6 +74,11 @@ FIBER_CH = ["vt", "hz"]
 # fiber_mode "direction" (tsm.fiber): one axial direction + a strength, instead of two classes
 FIBER_DIR_HEAD: dict[str, int] = {"fiber": 4}
 FIBER_DIR_CH = ["dz", "dy", "dx", "strength"]
+# optional Local Shape Descriptor head (extra.train.heads.lsd, "sides" mode): the five
+# descriptors of tsm.data.lsd_targets -- [off_z, off_y, off_x] (voxels, raw), thickness
+# (voxels, raw) and the normal-incoherence LOGIT
+LSD_HEAD: dict[str, int] = {"lsd": 5}
+LSD_CH = ["off_z", "off_y", "off_x", "thick", "ncov"]
 
 
 def fiber_head(fiber_mode: str = "class") -> dict[str, int]:
@@ -86,7 +91,7 @@ def fiber_head(fiber_mode: str = "class") -> dict[str, int]:
 
 
 def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
-              gap_class: bool = False) -> dict[str, int]:
+              gap_class: bool = False, lsd: bool = False) -> dict[str, int]:
     """Head widths for a surface mode: "medial" (default), "faces" (surface head = 3) or
     "body" (the orientation-free ``min(sdf_in, -sdf_out)``: the *medial* widths, surface head
     = 2 = [sdf_body, valid logit], so the export / TRT layout is unchanged) or "sides"
@@ -95,9 +100,13 @@ def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str
     again nothing in the export / TRT layout changes);
     ``fiber`` appends the fibre head in either mode (2 channels in the ``"class"`` mode,
     4 in ``"direction"``).  ``gap_class`` (sides mode only, ``extra.train.surface_aux.gap_class``
-    > 0) widens the surface head to 4 = [d_face, body logit, valid logit, gap logit]."""
+    > 0) widens the surface head to 4 = [d_face, body logit, valid logit, gap logit].
+    ``lsd`` (sides mode only, ``extra.train.heads.lsd``) adds the separate 5-channel Local
+    Shape Descriptor head (:func:`tsm.data.lsd_targets`)."""
     if gap_class and surface_mode != "sides":
         raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
+    if lsd and surface_mode != "sides":
+        raise ValueError(f"heads.lsd needs surface_mode='sides', got {surface_mode!r}")
     if surface_mode in ("faces", "sides"):
         h = dict(FACE_HEADS)
         if gap_class:
@@ -112,6 +121,8 @@ def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str
                          f"got {surface_mode!r}")
     if fiber:
         h.update(fiber_head(fiber_mode))
+    if lsd:
+        h.update(LSD_HEAD)
     return h
 WINDING_CH = ["sin", "cos", "density", "nx", "ny", "nz", "conf", "spare"]
 
@@ -670,9 +681,10 @@ def build_model(
     fiber: bool = False,
     fiber_mode: str = "class",
     gap_class: bool = False,
+    lsd: bool = False,
     **kw,
 ) -> nn.Module:
-    kw.setdefault("heads", heads_for(surface_mode, fiber, fiber_mode, gap_class))
+    kw.setdefault("heads", heads_for(surface_mode, fiber, fiber_mode, gap_class, lsd))
     net = TSMNet(widths=widths, in_ch=in_ch, aux_ch=aux_ch, act_ckpt=act_ckpt,
                  body_stride=body_stride, fullres_width=fullres_width, norm=norm, **kw)
     if channels_last:

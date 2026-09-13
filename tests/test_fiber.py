@@ -276,8 +276,8 @@ def test_train_opts_validates_the_heads_block():
     base = {"volume": {"url": "x", "voxel_um": 2.4}, "region": {"start_zyx": [0, 0, 0], "size_zyx": [8, 8, 8]},
             "out_dir": "/tmp/x"}
     mk = lambda tr: parse_config({**base, "extra": {"train": tr}})  # noqa: E731
-    assert train_opts(mk({}))["heads"] == {"fiber": False}
-    assert train_opts(mk({"heads": {"fiber": True}}))["heads"] == {"fiber": True}
+    assert train_opts(mk({}))["heads"] == {"fiber": False, "lsd": False}
+    assert train_opts(mk({"heads": {"fiber": True}}))["heads"] == {"fiber": True, "lsd": False}
     assert train_opts(mk({}))["loss_weights"]["fiber"] == 1.0
     assert train_opts(mk({"loss_weights": {"fiber": 4.0}}))["loss_weights"]["fiber"] == 4.0
     with pytest.raises(ValueError, match="unknown extra.train.heads keys"):

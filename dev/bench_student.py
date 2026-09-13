@@ -182,6 +182,7 @@ def build_student(cname: str, ckpt: str, device: torch.device, voxel_um: float, 
                      input_axis=bool(info.get("input_axis", False)),
                      axis_tangent=bool(info.get("axis_tangent", False)),
                      gap_class=bool(info.get("gap_class", False)),
+                     lsd=bool(info.get("lsd", False)),
                      fiber_mode=str(info.get("fiber_mode", "class"))).to(device)
     return net, info, model
 
@@ -196,7 +197,7 @@ def run_config(cname: str, box: np.ndarray, ckpt: str, cfg_path: str, results_pa
     net, info, model = build_student(cname, ckpt, device, voxel_um, clip, None)
     smode = info.get("surface_mode", "medial")
     nhead = n_head_ch(smode, bool(info.get("fiber", False)), str(info.get("fiber_mode", "class")),
-                      bool(info.get("gap_class", False)))
+                      bool(info.get("gap_class", False)), bool(info.get("lsd", False)))
     rf = int(info.get("rf_radius", model.receptive_field_radius()))
     row: dict = {"config": cname, "backend": c["backend"], "patch": c["patch"], "tiling": c["tiling"],
                  "body_stride": c["body_stride"], "rf_radius": rf, "surface_mode": smode,
@@ -239,7 +240,8 @@ def run_config(cname: str, box: np.ndarray, ckpt: str, cfg_path: str, results_pa
                          input_radial=bool(info.get("input_radial", False)), axis=info.get("axis_path"),
                          input_axis=bool(info.get("input_axis", False)),
                          axis_tangent=bool(info.get("axis_tangent", False)),
-                         gap_class=bool(info.get("gap_class", False))).to(device)
+                         gap_class=bool(info.get("gap_class", False)),
+                         lsd=bool(info.get("lsd", False))).to(device)
         del model
         free_cuda()
     net = prepare_net(net, spec, device)

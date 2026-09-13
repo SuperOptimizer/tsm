@@ -61,6 +61,11 @@ transform ever swaps them.  The body SDF is a plain scalar SDF and rides the med
 In "sides" mode the face distance rides that same scalar path (it is >= 0, so the
 saturation rule and the isotropic ``s_iso`` factor apply unchanged) and the body mask moves with the grid like ``ink_prob``;
 neither has a sign or a side to swap, so every flip and rotation leaves them alone.
+
+Local Shape Descriptors (``extra.train.heads.lsd``, "sides" mode only): an optional auxiliary
+regression target derived from the same two face labels, :func:`lsd_targets` -- the offset to
+the sheet centre plane (a vector), the windowed sheet thickness (a length) and the windowed
+normal incoherence (a rotation-invariant scalar).  Carried as ``lsd`` (5) + ``lsd_valid`` (1).
 """
 
 from __future__ import annotations
@@ -78,7 +83,7 @@ import torch.nn.functional as F
 import zarr
 from torch.utils.data import Dataset
 
-from tsm.fiber import FIBER_MODES, derive_direction_targets, axis_swap_needed, swap_band_class
+from tsm.fiber import FIBER_MODES, derive_direction_targets, axis_swap_needed, sheet_normal, swap_band_class
 from tsm.limits import Budget
 from tsm.student import BASE_UM, WINDING_CH, scale_channel_value
 from tsm.volume import VolumeReader, VolumeReadError
@@ -103,8 +108,11 @@ SURFACE_WEIGHT_KEY = "surface_weight"
 #: the 0/1 sheet-body occupancy target of ``surface_mode="sides"`` (:func:`body_mask_np`); it
 #: is a plain [0, 1] scalar field and moves with the grid exactly like ``ink_prob``
 SURFACE_BODY_KEY = "surface_body"
+#: the Local Shape Descriptor target and its mask (``extra.train.heads.lsd``, sides mode);
+#: see :func:`lsd_targets`
+LSD_KEY, LSD_VALID_KEY = "lsd", "lsd_valid"
 #: target keys that are neither in ``TARGET_KEYS`` nor fibre keys (optional, mode/store-driven)
-EXTRA_TARGET_KEYS = (SURFACE_WEIGHT_KEY, SURFACE_BODY_KEY)
+EXTRA_TARGET_KEYS = (SURFACE_WEIGHT_KEY, SURFACE_BODY_KEY, LSD_KEY, LSD_VALID_KEY)
 COARSE_CHANNELS = ["phase_sin", "phase_cos", "density", "nx", "ny", "nz", "conf", "valid"]
 #: the native-2.4 um winding block (tsm.winding_fine); present only in stores built with
 #: ``extra.labels.winding_fine``.  Same encodings as the coarse channels above, except that
@@ -153,6 +161,172 @@ def body_mask_np(sdf_in: np.ndarray, sdf_out: np.ndarray) -> np.ndarray:
     return (np.asarray(sdf_in) > 0) & (np.asarray(sdf_out) < 0)
 
 
+# --------------------------------------------------------------------------- #
+# Local Shape Descriptors (sides mode, extra.train.heads.lsd)
+# --------------------------------------------------------------------------- #
+#: the five descriptor channels, in order (:func:`lsd_targets`)
+LSD_CHANNELS = ["lsd_off_z", "lsd_off_y", "lsd_off_x", "lsd_thick", "lsd_ncov"]
+#: ``extra.train.lsd_sigma``: the gaussian window of the descriptors, in voxels
+LSD_SIGMA = 6.0
+#: smallest gaussian sigma (voxels) the windowed descriptors are ever evaluated at: the window
+#: is computed on a grid ``factor = sigma // LSD_COARSE_SIGMA`` times coarser than the crop
+#: (capped at :data:`LSD_COARSE_MAX`), which costs ``factor**3`` less.  A field smoothed with
+#: sigma 6 has essentially no power above the Nyquist frequency of a 4-voxel grid, so this is a
+#: sampling choice, not an approximation of the window itself; only the block-replicated
+#: reconstruction is coarse, and it is applied to the two *smooth* channels (thickness and
+#: normal incoherence), never to the offset vector, which stays exact at full resolution.
+#: The block grid is mapped onto itself by every cube symmetry of a crop whose size is a
+#: multiple of the factor, so the derivation still commutes exactly with the 48 flips/rotations.
+LSD_COARSE_SIGMA = 1.5
+LSD_COARSE_MAX = 4
+#: gaussian truncation radius, in sigmas (scipy's default is 4)
+LSD_TRUNCATE = 3.0
+
+
+def _block_mean(x: np.ndarray, f: int) -> np.ndarray:
+    """(C, Z, Y, X) -> the mean over ``f**3`` blocks (edge-padded to a multiple of ``f``).
+
+    One axis at a time (a strided sum per axis, shrinking the array as it goes): ~5x faster
+    than the reshape-and-mean, which reduces over three strided axes of the full crop at once."""
+    if f == 1:
+        return x
+    pad = [(0, (-int(n)) % f) for n in x.shape[1:]]
+    if any(p[1] for p in pad):
+        x = np.pad(x, [(0, 0)] + pad, mode="edge")
+    for ax in (1, 2, 3):
+        sl = [slice(None)] * 4
+        sl[ax] = slice(0, None, f)
+        acc = x[tuple(sl)].copy()
+        for i in range(1, f):
+            sl[ax] = slice(i, None, f)
+            acc += x[tuple(sl)]
+        x = acc
+    return x * np.float32(1.0 / f ** 3)
+
+
+def _block_repeat(x: np.ndarray, f: int, shape: Sequence[int]) -> np.ndarray:
+    """Inverse of :func:`_block_mean`: replicate each block value, then crop to ``shape``."""
+    if f == 1:
+        return x
+    up = np.repeat(np.repeat(np.repeat(x, f, 1), f, 2), f, 3)
+    z, y, xx = (int(v) for v in shape)
+    return up[:, :z, :y, :xx]
+
+
+def _max_eig_sym3(s: np.ndarray) -> np.ndarray:
+    """Largest eigenvalue of the symmetric 3x3 matrices ``s`` = [aa, bb, cc, ab, ac, bc].
+
+    Closed form (the standard trigonometric solution of the characteristic cubic), so a whole
+    crop costs a handful of elementwise passes instead of a per-voxel ``eigvalsh``."""
+    a00, a11, a22, a01, a02, a12 = (s[i] for i in range(6))
+    tr = a00 + a11 + a22
+    q = tr / 3.0
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
+    p = np.sqrt(np.maximum(p2, 0.0) / 6.0) + 1e-12
+    b00, b11, b22 = (a00 - q) / p, (a11 - q) / p, (a22 - q) / p
+    b01, b02, b12 = a01 / p, a02 / p, a12 / p
+    det = (b00 * (b11 * b22 - b12 * b12) - b01 * (b01 * b22 - b12 * b02)
+           + b02 * (b01 * b12 - b11 * b02))
+    phi = np.arccos(np.clip(det / 2.0, -1.0, 1.0)) / 3.0
+    return q + 2.0 * p * np.cos(phi)
+
+
+def lsd_coarse_factor(sigma: float = LSD_SIGMA) -> int:
+    """Grid coarsening of the windowed descriptors for a window sigma (see :data:`LSD_COARSE_SIGMA`)."""
+    return int(max(1, min(LSD_COARSE_MAX, int(float(sigma) // LSD_COARSE_SIGMA))))
+
+
+def lsd_targets(sdf_in: np.ndarray, sdf_out: np.ndarray, valid: np.ndarray, normal: np.ndarray,
+                sigma: float = LSD_SIGMA, clip: float = CLIP,
+                factor: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """**Local Shape Descriptors** for sheets (Sheridan et al., Nat Methods 2023), adapted.
+
+    The neuron-segmentation LSDs summarise, in a gaussian window around every voxel and
+    restricted to the voxels of the *same object*, where the object sits and how it is shaped;
+    they are an auxiliary regression target that makes a boundary network see more than its own
+    receptive field.  A sheet has a much simpler shape vocabulary than a neuron, so three
+    quantities carry all of it -- all derived from the two face labels ``sdf_in`` / ``sdf_out``
+    of the crop and the outward label normal ``normal`` ((z, y, x) components), on the
+    label-body voxels (:func:`body_mask_np`) where ``valid == 1``:
+
+    ``off`` (3, voxels, channels ``lsd_off_z/y/x``)
+        the vector from the voxel to the **centre plane of its own sheet**,
+        ``n * (d_out - d_in) / 2`` with ``d_in = |sdf_in|`` and ``d_out = |sdf_out|`` the
+        distances to the two faces along the normal.  It is 0 on the medial ridge, points
+        outward (along ``+n``) on the inner half of the sheet and inward on the outer half, and
+        its length is at most half the sheet thickness.  Pointwise and exact -- no window --
+        because the two face SDFs already carry the neighbourhood a windowed mean would
+        estimate, and the sharp target is the better teacher.  A true (polar) **vector**: a
+        spatial transform pushes it forward with ``L`` (which also scales it, as a length must).
+    ``thick`` (1, voxels, ``lsd_thick``)
+        the local sheet thickness ``d_in + d_out`` (clipped to ``2 * clip``), **averaged over
+        the gaussian window of ``sigma``, restricted to body voxels**.  A length: it scales with
+        an isotropic transform.
+    ``ncov`` (1, [0, 1], ``lsd_ncov``)
+        "normal incoherence": ``1 - lambda_max(S) / trace(S)`` of the windowed normal scatter
+        ``S = G * (n n^T)`` (same-body normalised).  0 on a flat, coherent sheet; it grows
+        where the normals inside the window disagree -- a crumple, a fold, or two sheets
+        crossing (perpendicular sheets in equal measure give 0.5; the isotropic maximum is
+        2/3).  Built from an outer product and its eigenvalues, so it is **rotation invariant**:
+        no transport rule, no sign, nothing for an augmentation to get wrong.
+
+    "Same body" is approximated by the label body mask: no per-sheet instance label exists here,
+    and the window deliberately spans the gap to the neighbouring wrap -- seeing that is exactly
+    what ``ncov`` is for.
+
+    The two windowed descriptors are evaluated on a ``factor``-times coarser grid
+    (``None`` = :func:`lsd_coarse_factor`, 4 at the default sigma) with the paper's same-body
+    normalisation ``G*(x*body) / max(G*body, eps)``.
+
+    Returns ``(lsd (5, Z, Y, X) = [off_z, off_y, off_x, thick, ncov], lsd_valid (1, Z, Y, X))``;
+    the descriptors are 0 wherever ``lsd_valid`` is 0 (not a body voxel, not ``valid == 1``, or
+    no usable normal)."""
+    from scipy.ndimage import gaussian_filter
+
+    si = np.asarray(sdf_in, np.float32)
+    so = np.asarray(sdf_out, np.float32)
+    nrm = np.asarray(normal, np.float32)
+    if nrm.shape != (3,) + si.shape:
+        raise ValueError(f"normal must be (3, Z, Y, X) matching the crop, got {nrm.shape} / {si.shape}")
+    f = lsd_coarse_factor(sigma) if factor is None else max(1, int(factor))
+    body = (body_mask_np(si, so) & (np.asarray(valid) == 1)
+            & ((nrm * nrm).sum(0) > 0.25))  # ... and a usable (unit) outward normal
+    bf = body.astype(np.float32)
+    di, do = np.abs(si), np.abs(so)
+    lsd = np.empty((5,) + si.shape, np.float32)
+    np.multiply(nrm, (0.5 * (do - di)) * bf, out=lsd[0:3])  # the offset vector, in place
+    # coarse grid: the body occupancy (the window denominator), the body-masked thickness and
+    # the body-masked normal
+    raw = np.empty((5,) + si.shape, np.float32)
+    raw[0] = bf
+    np.multiply(np.clip(di + do, 0.0, 2.0 * float(clip)), bf, out=raw[1])
+    np.multiply(nrm, bf, out=raw[2:5])
+    small = _block_mean(raw, f)
+    del raw
+    den = np.maximum(small[0], 1e-6)
+    nh = small[2:5] / den
+    nh /= np.maximum(np.sqrt((nh * nh).sum(0)), 1e-6)
+    # mean(n n^T * body) per block: 5 of the 6 unique entries [zz, yy, zy, zx, yx].  The sixth,
+    # xx, never has to be smoothed -- the trace of the scatter is ``mean(|n|^2 * body)`` = the
+    # body occupancy itself, so ``xx = body - zz - yy`` after the same gaussian.
+    nn = np.stack([nh[i] * nh[j] * small[0] for i, j in ((0, 0), (1, 1), (0, 1), (0, 2), (1, 2))])
+    stack = np.concatenate([small[0:2], nn], 0)
+    sm = np.empty_like(stack)
+    sg = float(sigma) / f
+    for c in range(stack.shape[0]):
+        gaussian_filter(stack[c], sg, truncate=LSD_TRUNCATE, output=sm[c], mode="nearest")
+    gd = np.maximum(sm[0], 1e-6)
+    thick_s = sm[1] / gd
+    # the windowed scatter, normalised so that its trace is exactly 1 (see above)
+    scat = sm[2:7] / gd
+    scat = np.stack([scat[0], scat[1], 1.0 - scat[0] - scat[1], scat[2], scat[3], scat[4]])
+    ncov = np.where(sm[0] > 1e-6, 1.0 - _max_eig_sym3(scat), 0.0)
+    up = _block_repeat(np.stack([thick_s, np.clip(ncov, 0.0, 1.0)]).astype(np.float32), f, si.shape)
+    np.multiply(up, bf, out=lsd[3:5])
+    return lsd, bf[None]
+
+
 # target keys handed to train.py; every item has all of them (fixed shapes)
 TARGET_KEYS = {
     "surface_sdf": 1,
@@ -166,7 +340,7 @@ TARGET_KEYS = {
 
 
 def target_keys(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
-                band: bool = False, surface_weight: bool = False) -> dict[str, int]:
+                band: bool = False, surface_weight: bool = False, lsd: bool = False) -> dict[str, int]:
     """``TARGET_KEYS`` for a surface mode. ``"faces"`` makes ``surface_sdf`` 2 channels
     ([sdf_in, sdf_out]) and ``surface_valid`` the ``faces_valid`` mask; ``"body"`` keeps the
     single ``surface_sdf`` channel (:func:`body_sdf`) with the same ``faces_valid`` mask;
@@ -189,7 +363,11 @@ def target_keys(surface_mode: str = "medial", fiber: bool = False, fiber_mode: s
 
     ``surface_weight`` adds ``surface_weight`` (1) = the store's ``faces_weight`` channel, a
     per-voxel multiplier on the surface loss (1 everywhere unless a human correction was
-    imported).  It is a plain scalar field: it moves with the grid like ``ink_prob``."""
+    imported).  It is a plain scalar field: it moves with the grid like ``ink_prob``.
+
+    ``lsd`` (``extra.train.heads.lsd``, "sides" mode only) adds the Local Shape Descriptors
+    ``lsd`` (5 = [off_z, off_y, off_x, thick, ncov], :func:`lsd_targets`) and their mask
+    ``lsd_valid`` (1)."""
     if surface_mode not in SURFACE_MODES:
         raise ValueError(f"surface_mode must be one of {SURFACE_MODES}, got {surface_mode!r}")
     t = dict(TARGET_KEYS)
@@ -212,6 +390,10 @@ def target_keys(surface_mode: str = "medial", fiber: bool = False, fiber_mode: s
             t["fiber_band"] = 1
     if surface_weight:
         t[SURFACE_WEIGHT_KEY] = 1
+    if lsd:
+        if surface_mode != "sides":
+            raise ValueError(f"the lsd targets need surface_mode='sides', got {surface_mode!r}")
+        t[LSD_KEY], t[LSD_VALID_KEY] = 5, 1
     return t
 
 
@@ -655,6 +837,14 @@ def augment(sample: dict[str, Any], rng: np.random.Generator, spatial: bool = Tr
             fields["_wscalar"] = w[:3]
             fields["normal"] = w[3:6]
             vkeys.append("normal")
+        # the LSD target: channels 0..2 are the offset VECTOR (z, y, x), 3 (thickness) and 4
+        # (normal incoherence) are scalars.  Flips and rot90 are isometries, so the two lengths
+        # are unchanged and only the offset components move.
+        lsd = fields.pop(LSD_KEY, None)
+        if lsd is not None:
+            fields["_lsdvec"] = lsd[0:3][::-1].copy()  # (off_z, off_y, off_x) -> (x, y, z)
+            fields["_lsdscalar"] = lsd[3:5]
+            vkeys.append("_lsdvec")
         # the (z, y, x)-ordered vector fields (the radial and scroll-axis input channels, the
         # fibre direction target); the vector rule below wants (x, y, z) component order.
         # NOTE the v1 path only flips and rot90s in the (y, x) plane, so the volume z axis is
@@ -667,6 +857,9 @@ def augment(sample: dict[str, Any], rng: np.random.Generator, spatial: bool = Tr
         fields = spatial_transform(fields, flips, rot_k, normal_key=vkeys or None)
         if w is not None:
             fields["winding"] = np.concatenate([fields.pop("_wscalar"), fields.pop("normal")], axis=0)
+        if lsd is not None:
+            fields[LSD_KEY] = np.concatenate([np.ascontiguousarray(fields.pop("_lsdvec")[::-1]),
+                                              fields.pop("_lsdscalar")], axis=0)
         for k in zyx:
             fields[k] = np.ascontiguousarray(fields[k][::-1])
         out.update(fields)
@@ -805,6 +998,8 @@ class CropDataset(Dataset):
         core_radius_vox: float = 0.0,
         axis_tangent: bool = True,
         body_ct_gate: float | None = None,
+        lsd: bool = False,
+        lsd_sigma: float = LSD_SIGMA,
     ) -> None:
         self.surface_mode = str(surface_mode)
         self.input_radial = bool(input_radial)
@@ -822,6 +1017,14 @@ class CropDataset(Dataset):
         # voxel stops supervising the surface targets -- see :meth:`load`.  None = off.
         self.body_ct_gate = None if body_ct_gate is None else float(body_ct_gate)
         self._ct_gate_crops = 0
+        # extra.train.heads.lsd: derive the Local Shape Descriptor targets in :meth:`load`
+        # (sides mode only -- they are built from the two face labels of that mode)
+        self.lsd = bool(lsd)
+        self.lsd_sigma = float(lsd_sigma)
+        if self.lsd and self.surface_mode != "sides":
+            raise ValueError(f"heads.lsd needs surface_mode='sides', got {surface_mode!r}")
+        if self.lsd_sigma <= 0:
+            raise ValueError(f"lsd_sigma must be > 0, got {lsd_sigma!r}")
         self._axis_spec = axis
         self.axis: np.ndarray | None = None  # loaded below, once fiber/fiber_mode are known
         self.patch = int(patch)
@@ -875,7 +1078,7 @@ class CropDataset(Dataset):
         self.has_faces_weight = FACES_WEIGHT_CHANNEL in self.fine.channels
         self.surface_weight = self.surface_mode in ("faces", "body", "sides") and self.has_faces_weight
         self.target_keys = target_keys(self.surface_mode, self.fiber, self.fiber_mode,
-                                       self.fiber_band, self.surface_weight)
+                                       self.fiber_band, self.surface_weight, self.lsd)
         self.valid_channel = "faces_valid" if self.surface_mode in ("faces", "body", "sides") else "sdf_valid"
         if self.valid_channel not in self.fine.channels:
             raise ValueError(f"fine store {self.fine.path} has no {self.valid_channel!r} channel "
@@ -967,6 +1170,7 @@ class CropDataset(Dataset):
         """Un-augmented sample at a local fine-store origin: ct (1,P,P,P) in [0,1] + targets."""
         store = self.fine
         P = self.patch
+        faces_sdf: tuple[np.ndarray, np.ndarray] | None = None  # (sdf_in, sdf_out), "sides" only
         z0, y0, x0 = (int(v) for v in origin_local)
         gz, gy, gx = (store.origin_zyx[i] + v for i, v in enumerate((z0, y0, x0)))
         ct = self.reader.read(gz, gz + P, gy, gy + P, gx, gx + P)
@@ -990,6 +1194,7 @@ class CropDataset(Dataset):
             so = decode_sdf(store.read("sdf_out", z0, y0, x0, P))
             t["surface_sdf"][0] = np.where(sv > 0, face_dist(si, so), 0.0)
             t["surface_body"][0] = np.where(sv > 0, body_mask_np(si, so), False).astype(np.float32)
+            faces_sdf = (si, so)
         else:
             sv = store.read("sdf_valid", z0, y0, x0, P)
             t["surface_sdf"][0] = np.where(sv > 0, decode_sdf(store.read("sdf", z0, y0, x0, P)), 0.0)
@@ -1056,6 +1261,17 @@ class CropDataset(Dataset):
             cm = core_mask(self.axis, (gz, gy, gx), (P, P, P), self.core_radius_vox, scale=1)
             t["surface_valid"][0] = np.where(cm, 2.0, t["surface_valid"][0])
             t["winding_valid"][0] = np.where(cm, 0.0, t["winding_valid"][0])
+        if self.lsd and faces_sdf is not None:
+            # Local Shape Descriptors from the same two face labels (tsm.data.lsd_targets).
+            # The outward normal is the winding normal target where that is a unit vector and
+            # grad(sdf_in) elsewhere -- the same rule the direction fibre targets use.
+            wn = t["winding"][3:6][::-1].copy()  # (nx, ny, nz) -> (nz, ny, nx)
+            wn *= (t["winding_valid"] == 1)
+            nrm, _ = sheet_normal(torch.from_numpy(faces_sdf[0])[None], torch.from_numpy(wn),
+                                  prefer_fallback=True)
+            lsd, lsd_valid = lsd_targets(faces_sdf[0], faces_sdf[1], t["surface_valid"][0],
+                                         nrm.numpy(), sigma=self.lsd_sigma)
+            t[LSD_KEY], t[LSD_VALID_KEY] = lsd, lsd_valid
         if self.input_radial:
             t["radial"] = frame["radial"]
         if self.input_axis:
@@ -1179,6 +1395,8 @@ class MultiStoreDataset(Dataset):
         self.input_radial = d0.input_radial
         self.input_axis = d0.input_axis
         self.axis_tangent = d0.axis_tangent
+        self.lsd = d0.lsd
+        self.lsd_sigma = d0.lsd_sigma
         tr = ([np.asarray(o, np.int32).reshape(-1, 3) for o in train_origins] if train_origins is not None
               else [d.origins for d in self.datasets])
         if len(tr) != len(self.datasets):
@@ -1212,7 +1430,7 @@ class MultiStoreDataset(Dataset):
             if d.coarse is not None and d0.coarse is not None and d.coarse.channels != d0.coarse.channels:
                 raise ValueError(f"store {name!r} has coarse channels {d.coarse.channels} != {d0.coarse.channels}")
             for attr in ("patch", "surface_mode", "winding_source", "fiber", "fiber_mode", "input_radial", "input_axis",
-                         "axis_tangent", "body_ct_gate"):
+                         "axis_tangent", "body_ct_gate", "lsd", "lsd_sigma"):
                 if getattr(d, attr) != getattr(d0, attr):
                     raise ValueError(f"store {name!r} has {attr}={getattr(d, attr)!r} != {getattr(d0, attr)!r}")
             if d.target_keys != d0.target_keys:
@@ -1851,9 +2069,17 @@ class Augment:
         sb = "surface_body" in batch
         if sb:
             parts_cont.append(batch["surface_body"].float() * m1)
+        # the Local Shape Descriptors carry their own validity (the label body), so they get
+        # their own mask-aware denominator; the transport rules are applied after resampling
+        ls = LSD_KEY in batch
+        if ls:
+            lv = batch[LSD_VALID_KEY].float()
+            ml = (lv == 1).float()
+            parts_cont += [batch[LSD_KEY].float() * ml, ml]
         cont = torch.cat(parts_cont, dim=1)
         s = F.grid_sample(cont, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        mask_in = torch.cat([sv, iv, wv] + ([fv] if fb else []) + ([batch["fiber_band"].float()] if fb_band else []), dim=1)
+        mask_in = torch.cat([sv, iv, wv] + ([fv] if fb else []) + ([batch["fiber_band"].float()] if fb_band else [])
+                            + ([lv] if ls else []), dim=1)
         masks = F.grid_sample(mask_in, grid, mode="nearest", padding_mode="zeros", align_corners=False)
         masks = torch.where(oob, torch.zeros_like(masks), masks)
         sv_t, iv_t, wv_t = masks[:, 0:1], masks[:, 1:2], masks[:, 2:3]
@@ -1919,6 +2145,17 @@ class Augment:
         if sb:
             a_sb = a_sw + (1 if sw else 0)
             out["surface_body"] = div(s[:, a_sb:a_sb + 1], den_s).clamp(0.0, 1.0) * (sv_t > 0).float()
+        if ls:
+            a_ls = a_sw + (1 if sw else 0) + (1 if sb else 0)
+            den_l = s[:, a_ls + 5:a_ls + 6]
+            ld = div(s[:, a_ls:a_ls + 5], den_l.expand(-1, 5, -1, -1, -1))
+            # off is a true (z, y, x) VECTOR and a length: L rotates it and carries the
+            # isotropic scale factor with it (exactly what s_iso does to every other length).
+            off = torch.einsum("bij,bjdhw->bidhw", L, ld[:, 0:3])
+            lv_t = masks[:, 3 + (1 if fb else 0) + (1 if fb_band else 0):][:, 0:1]
+            out[LSD_KEY] = torch.cat([off, ld[:, 3:4] * s_iso, ld[:, 4:5].clamp(0.0, 1.0)],
+                                     dim=1) * (lv_t == 1).float()
+            out[LSD_VALID_KEY] = lv_t
         return out
 
     # ---- intensity ------------------------------------------------------------------ #
