@@ -115,8 +115,9 @@ _PROB = (
     "valid", "ink", "conf", "spare", "recto", "surface", "m7",
     "fiber_bg", "fiber_vt", "fiber_hz", "fiber_ink", "fiber_strength",
     "surface1", "surface_in1", "surface_out1", "surface_body1", "surface_side1",
-    # surface_mode "sides": the sheet-body probability head
-    "body",
+    # surface_mode "sides": the sheet-body probability head, and the optional air-gap head
+    # of extra.train.surface_aux.gap_class
+    "body", "gap",
 )
 #: signed [-1, 1] scalars that are not part of a vector
 _SIGNED = ("sin", "cos", "phase_sin", "phase_cos", "grad_mag")
@@ -358,8 +359,8 @@ class StudentSource(Source):
         import torch
 
         from tsm.infer import (INFER_DEFAULTS, _checkpoint_fiber, _checkpoint_fiber_mode,
-                               _checkpoint_surface_mode, StudentNet, load_student, n_head_ch,
-                               pred_channels, tta_transforms)
+                               _checkpoint_gap_class, _checkpoint_surface_mode, StudentNet,
+                               load_student, n_head_ch, pred_channels, tta_transforms)
         from tsm.sliding import WindowSpec
 
         log = log or _log
@@ -377,8 +378,9 @@ class StudentSource(Source):
         tta_transforms(self.tta)  # validated here, applied inside StudentNet
         smode = _checkpoint_surface_mode(self.checkpoint)
         fiber, fmode = _checkpoint_fiber(self.checkpoint), _checkpoint_fiber_mode(self.checkpoint)
-        self.channels = pred_channels(smode, fiber, fmode)
-        self.n_head = n_head_ch(smode, fiber, fmode)
+        gap_cls = _checkpoint_gap_class(self.checkpoint)
+        self.channels = pred_channels(smode, fiber, fmode, gap_cls)
+        self.n_head = n_head_ch(smode, fiber, fmode, gap_cls)
         self.surface_mode = smode
         t0 = time.perf_counter()
         model, info = load_student(self.checkpoint, "cuda")
@@ -389,7 +391,8 @@ class StudentSource(Source):
                               input_radial=bool(info.get("input_radial", False)),
                               axis=info.get("axis_path"), input_axis=bool(info.get("input_axis", False)),
                               axis_tangent=bool(info.get("axis_tangent", False)),
-                              fiber_mode=str(info.get("fiber_mode", fmode))).to("cuda")
+                              fiber_mode=str(info.get("fiber_mode", fmode)),
+                              gap_class=bool(info.get("gap_class", gap_cls))).to("cuda")
         self.spec = WindowSpec(patch=int(patch), step=int(patch) // 2, out_tile=int(out_tile),
                                halo=None, batch=int(batch), tta=False, dtype=torch.bfloat16,
                                norm_scope="window", prefetch=False)

@@ -85,7 +85,8 @@ def fiber_head(fiber_mode: str = "class") -> dict[str, int]:
     raise ValueError(f"fiber_mode must be 'class' or 'direction', got {fiber_mode!r}")
 
 
-def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> dict[str, int]:
+def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
+              gap_class: bool = False) -> dict[str, int]:
     """Head widths for a surface mode: "medial" (default), "faces" (surface head = 3) or
     "body" (the orientation-free ``min(sdf_in, -sdf_out)``: the *medial* widths, surface head
     = 2 = [sdf_body, valid logit], so the export / TRT layout is unchanged) or "sides"
@@ -93,9 +94,17 @@ def heads_for(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str
     [d_face (raw voxels), body logit, valid logit] -- the same width as the two-face head, so
     again nothing in the export / TRT layout changes);
     ``fiber`` appends the fibre head in either mode (2 channels in the ``"class"`` mode,
-    4 in ``"direction"``)."""
+    4 in ``"direction"``).  ``gap_class`` (sides mode only, ``extra.train.surface_aux.gap_class``
+    > 0) widens the surface head to 4 = [d_face, body logit, valid logit, gap logit]."""
+    if gap_class and surface_mode != "sides":
+        raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
     if surface_mode in ("faces", "sides"):
         h = dict(FACE_HEADS)
+        if gap_class:
+            # extra.train.surface_aux.gap_class > 0: one MORE surface channel, the air-gap
+            # logit, appended after the valid logit -> [d_face, body, valid, gap].  Only
+            # "sides" ever asks for it; every other mode keeps the historical head layout.
+            h["surface"] = h["surface"] + 1
     elif surface_mode in ("medial", "body"):
         h = dict(HEADS)
     else:
@@ -660,9 +669,10 @@ def build_model(
     norm: str = "group",
     fiber: bool = False,
     fiber_mode: str = "class",
+    gap_class: bool = False,
     **kw,
 ) -> nn.Module:
-    kw.setdefault("heads", heads_for(surface_mode, fiber, fiber_mode))
+    kw.setdefault("heads", heads_for(surface_mode, fiber, fiber_mode, gap_class))
     net = TSMNet(widths=widths, in_ch=in_ch, aux_ch=aux_ch, act_ckpt=act_ckpt,
                  body_stride=body_stride, fullres_width=fullres_width, norm=norm, **kw)
     if channels_last:

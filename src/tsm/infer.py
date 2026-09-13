@@ -122,10 +122,18 @@ FIBER_DIR_PRED_CHANNELS = ["fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength"]
 N_FIBER_DIR_HEAD_CH = 4
 
 
-def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> list[str]:
+def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
+                  gap_class: bool = False) -> list[str]:
+    """Channel names of pred.zarr for a mode.  ``gap_class`` (sides mode, a checkpoint trained
+    with ``extra.train.surface_aux.gap_class > 0``) inserts the extra head channel ``gap``
+    right after ``valid``; without it the layout is the historical one."""
     base = {"faces": FACE_PRED_CHANNELS, "body": BODY_PRED_CHANNELS,
             "sides": SIDES_PRED_CHANNELS}.get(surface_mode, PRED_CHANNELS)
     base = list(base)
+    if gap_class:
+        if surface_mode != "sides":
+            raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
+        base.insert(base.index("valid") + 1, "gap")
     if not fiber:
         return base
     cut = base.index("spare") + 1  # the derived (non-head) channels follow `spare`
@@ -135,9 +143,14 @@ def pred_channels(surface_mode: str = "medial", fiber: bool = False, fiber_mode:
     return base[:cut] + list(FIBER_PRED_CHANNELS) + base[cut:]
 
 
-def n_head_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class") -> int:
+def n_head_ch(surface_mode: str = "medial", fiber: bool = False, fiber_mode: str = "class",
+              gap_class: bool = False) -> int:
     n = {"faces": N_FACE_HEAD_CH, "body": N_BODY_HEAD_CH,
          "sides": N_SIDES_HEAD_CH}.get(surface_mode, N_HEAD_CH)
+    if gap_class:
+        if surface_mode != "sides":
+            raise ValueError(f"gap_class needs surface_mode='sides', got {surface_mode!r}")
+        n += 1
     if not fiber:
         return n
     return n + (N_FIBER_DIR_HEAD_CH if fiber_mode == "direction" else N_FIBER_HEAD_CH)
@@ -243,6 +256,29 @@ def _checkpoint_fiber_mode(ckpt: str) -> str:
     return str(cfgb.get("fiber_mode") or (cfgb.get("train") or {}).get("fiber_mode") or "class")
 
 
+def checkpoint_gap_class(cfgb: dict[str, Any]) -> bool:
+    """True when a checkpoint's config blob says the sides head carries the extra ``gap`` channel.
+
+    Written as a top-level ``gap_class`` flag by :func:`tsm.train.run_train`; for a config blob
+    that predates the flag it is inferred from ``train.surface_aux.gap_class > 0`` (and is
+    False -- the historical 3-channel head -- when neither is present)."""
+    tb = cfgb.get("train") or {}
+    if "gap_class" in cfgb:
+        return bool(cfgb["gap_class"])
+    return float((tb.get("surface_aux") or {}).get("gap_class", 0.0) or 0.0) > 0.0
+
+
+def _checkpoint_gap_class(ckpt: str) -> bool:
+    """:func:`checkpoint_gap_class` read straight off a checkpoint path (False when unreadable)."""
+    if not os.path.exists(ckpt):
+        return False
+    try:
+        cfgb = torch.load(ckpt, map_location="cpu", weights_only=False).get("config") or {}
+    except Exception:
+        return False
+    return checkpoint_gap_class(cfgb)
+
+
 def _opts(cfg: RunCfg, key: str, defaults: dict[str, Any]) -> dict[str, Any]:
     raw = cfg.extra.get(key, {})
     if not isinstance(raw, dict):
@@ -280,7 +316,8 @@ def activate_heads(out: dict[str, torch.Tensor], surface_mode: str = "medial",
         # [d_face, body logit, valid logit]: the distance is relu'd (training used the raw head
         # output, relu only enforces the >= 0 the target already guarantees), the other two are
         # probabilities
-        head = [torch.relu(s[:, 0:1]), torch.sigmoid(s[:, 1:3])]
+        # [d_face, body logit, valid logit] (+ the optional gap logit of surface_aux.gap_class)
+        head = [torch.relu(s[:, 0:1]), torch.sigmoid(s[:, 1:])]
     else:
         head = [s[:, 0:ns], torch.sigmoid(s[:, ns:ns + 1])]
     parts = head + [torch.sigmoid(i[:, 0:1]), sc, torch.relu(w[:, 2:3]), n,
@@ -295,7 +332,7 @@ def activate_heads(out: dict[str, torch.Tensor], surface_mode: str = "medial",
 
 
 def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
-            fiber_mode: str = "class") -> torch.Tensor:
+            fiber_mode: str = "class", gap_class: bool = False) -> torch.Tensor:
     """(B, 11 | 12, ...) physical values -> [0, 1] so that round(u*255) is the label-store byte.
 
     sdf -> (128 + clip(sdf)*127/clip)/255 (bytes 1..255, 0 stays "no data"); in the two-face mode
@@ -310,8 +347,11 @@ def to_unit(phys: torch.Tensor, clip: float, surface_mode: str = "medial",
         # d_face uses the SAME sdf byte encoding, clamped to [0, clip] so every byte is >= 128:
         # any reader that decodes an sdf channel reads it back as a non-negative distance.
         # `body` is a plain probability.
-        o = 1
-        head = [(128.0 + phys[:, 0:1].clamp(0.0, clip) * (127.0 / clip)) / 255.0, phys[:, 1:4]]
+        # `body` (and, with surface_aux.gap_class, `gap`) are plain probabilities; every
+        # channel after them shifts by one, which is what the extra `o` accounts for.
+        g = 1 if gap_class else 0
+        o = 1 + g
+        head = [(128.0 + phys[:, 0:1].clamp(0.0, clip) * (127.0 / clip)) / 255.0, phys[:, 1:4 + g]]
     else:
         o = ns - 1
         head = [(128.0 + phys[:, 0:ns].clamp(-clip, clip) * (127.0 / clip)) / 255.0,
@@ -352,7 +392,7 @@ def decode_pred(u8: np.ndarray, clip: float, channels: Sequence[str] = PRED_CHAN
         alias = next((k for k in ("sdf_in", "sdf_body", "d_face") if k in out), None)
         if alias is not None:
             out["sdf"] = out[alias]
-    for k in ("valid", "body", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength"):
+    for k in ("valid", "body", "gap", "ink", "conf", "spare", "fiber_vt", "fiber_hz", "fiber_strength"):
         if k in ch:
             out[k] = decode_prob(ch[k])
     for k in ("fiber_dz", "fiber_dy", "fiber_dx"):
@@ -471,7 +511,7 @@ class StudentNet(nn.Module):
     def __init__(self, net: nn.Module, voxel_um: float, clip: float, tta: str | bool = "none",
                  surface_mode: str = "medial", input_radial: bool = False, axis: Any = None,
                  input_axis: bool = False, fiber_mode: str = "class",
-                 axis_tangent: bool = True) -> None:
+                 axis_tangent: bool = True, gap_class: bool = False) -> None:
         super().__init__()
         self.net = net
         self.scale = float(scale_channel_value(voxel_um))
@@ -485,6 +525,8 @@ class StudentNet(nn.Module):
         # in-plane radial -- what every checkpoint written before 2026-09-12 was trained with.
         self.axis_tangent = bool(axis_tangent)
         self.fiber_mode = str(fiber_mode)
+        # surface_mode "sides" trained with surface_aux.gap_class: one more head channel (`gap`)
+        self.gap_class = bool(gap_class)
         # sliding.predict_box hands the absolute origin of every window to a net that asks for it
         self.needs_box_origin = self.input_radial or self.input_axis
         self.axis = None
@@ -547,7 +589,7 @@ class StudentNet(nn.Module):
 
     def forward(self, x: torch.Tensor, box_origin_zyx: Any = None) -> torch.Tensor:
         phys = activate_heads(self.raw(x, box_origin_zyx), self.surface_mode, self.fiber_mode)
-        return to_unit(phys, self.clip, self.surface_mode, self.fiber_mode)
+        return to_unit(phys, self.clip, self.surface_mode, self.fiber_mode, self.gap_class)
 
 
 def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) -> dict[str, Any]:
@@ -572,6 +614,9 @@ def student_build_kw(cfgb: dict[str, Any], widths: Sequence[int] | None = None) 
         # ... and its width depends on the fibre target encoding (2 = class, 4 = direction);
         # a checkpoint written before fiber_mode existed is a 2-channel class head
         "fiber_mode": str(g("fiber_mode", None) or "class"),
+        # the extra sides head channel of extra.train.surface_aux.gap_class; absent (False) in
+        # every checkpoint written before it existed, so those still build a 3-channel head
+        "gap_class": checkpoint_gap_class(cfgb),
     }
 
 
@@ -648,6 +693,7 @@ def load_student(path: str, device: str | torch.device = "cpu", widths: Sequence
                    "in_ch": in_channels(radial, ax_in), "input_channels": input_channels(radial, ax_in),
                    "body_stride": kw["body_stride"], "fullres_width": kw["fullres_width"], "norm": kw["norm"],
                    "fiber": bool(kw["fiber"]), "fiber_mode": str(kw["fiber_mode"]),
+                   "gap_class": bool(kw["gap_class"]),
                    "rf_radius": int(model.receptive_field_radius())}
 
 
@@ -924,7 +970,12 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
     smode = _checkpoint_surface_mode(ckpt, opts.get("surface_mode"))
     fiber = _checkpoint_fiber(ckpt)
     fmode = _checkpoint_fiber_mode(ckpt)
-    channels, nhead = pred_channels(smode, fiber, fmode), n_head_ch(smode, fiber, fmode)
+    gap_cls = _checkpoint_gap_class(ckpt)
+    channels = pred_channels(smode, fiber, fmode, gap_cls)
+    nhead = n_head_ch(smode, fiber, fmode, gap_cls)
+    if gap_cls:
+        print("[infer] sides head trained with surface_aux.gap_class: writing the extra `gap` "
+              "channel (P(this voxel is the air gap between two sheets))", flush=True)
     if fiber:
         print(f"[infer] fibre head present (fiber_mode={fmode}): writing "
               f"{FIBER_DIR_PRED_CHANNELS + FIBER_PRED_CHANNELS if fmode == 'direction' else FIBER_PRED_CHANNELS}",
@@ -987,7 +1038,8 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
                      axis=opts.get("axis_path") or info.get("axis_path"),
                      input_axis=bool(info.get("input_axis", False)),
                      axis_tangent=bool(info.get("axis_tangent", False)),
-                     fiber_mode=str(info.get("fiber_mode", fmode))).to(device)
+                     fiber_mode=str(info.get("fiber_mode", fmode)),
+                     gap_class=bool(info.get("gap_class", gap_cls))).to(device)
     print(f"[infer] loaded {info} in {time.perf_counter() - t:.1f}s, params={model.num_params() / 1e6:.2f}M", flush=True)
     reader = open_ct(cfg, 0, int(opts["probe_brick"]))
     writer = BrickWriter(pred_path, channels, region.size_zyx, chunk=int(opts["chunk"]),
@@ -1026,6 +1078,8 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
             "d_face": (f"round(128 + clip(d_face, 0, {clip:g})*127/{clip:g}); the UNSIGNED distance "
                        f"to the nearest sheet face, bytes >= 128, 0 = no data (sides mode)"),
             "body": "sigmoid * 255: P(this voxel is papyrus body) (sides mode)",
+            "gap": ("sigmoid * 255: P(this voxel is the thin air gap between two sheets) "
+                    "(sides mode, surface_aux.gap_class)"),
             "surface_side1": "255 where d_face <= 1 and valid >= 0.5 (sides mode)",
             "thickness": "round(clip(sdf_in - sdf_out, 0, 255)) voxels (two-face mode)",
         },

@@ -185,6 +185,11 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     # scroll axis get surface_valid = 2 (ignore) and winding_valid = 0 (see data.CropDataset).
     # 0 = off (unchanged).  The label-build-time equivalent is extra.labels.core_radius_vox.
     "core_radius_vox": 0.0,
+    # CT-gated body label (surface_mode "body" / "sides"), null = off.  A threshold in RAW
+    # uint8 CT units (e.g. 60): label-body voxels whose gaussian-smoothed (sigma 2) CT is below
+    # it get surface_valid = 2 (ignore), so the air the label calls papyrus stops supervising
+    # the surface targets.  The label STORE is never touched (data.CropDataset.load).
+    "body_ct_gate": None,
     # where the winding targets come from: "coarse" (default, unchanged: the 9.6 um store
     # upsampled on the fly), "fine" (the native 2.4 um wf_* block only, tsm.winding_fine) or
     # "merge" (fine where wf_valid == 1, coarse elsewhere).  A store without wf_* is "coarse".
@@ -234,6 +239,16 @@ SURFACE_AUX_DEFAULTS: dict[str, Any] = {
     "gap_tau": 2.0,        # softness (voxels) of the predicted body probability
     "cldice": 0.0,         # weight of the soft-clDice (topology) term on the sheet body
     "cldice_iters": 5,     # soft skeletonisation iterations
+    # explicit air-gap supervision (sides mode; see :func:`surface_body_terms`)
+    "gap_dilate": 0,       # dilate the LABEL gap mask by this many voxels before it is used by
+                           # `gap` and `gap_class` (bias toward under-connection); 0 = unchanged
+    "gap_class": 0.0,      # weight of the BCE + soft Dice of a dedicated gap HEAD channel
+                           # against that label gap mask (widens the sides head to 4 channels)
+    "gap_border_weight": 0.0,  # Ronneberger-style w0: extra per-voxel weight on the gap voxels
+                           # that touch a body, added to the d_face L1 and body BCE masks
+    # eikonal regulariser on the predicted unsigned distance (sides mode)
+    "eikonal": 0.0,        # weight of mean (|grad d_pred| - 1)^2 away from faces / ridge
+    "eikonal_min_d": 3.0,  # label d_face above which a voxel is supervised by it
 }
 BALANCE_MODES = (None, "scale", "gradnorm_lite")
 SDF_SIGMA = 4.0
@@ -299,6 +314,13 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
     if float(opts["core_radius_vox"]) < 0:
         raise ValueError("extra.train.core_radius_vox must be >= 0")
     opts["core_radius_vox"] = float(opts["core_radius_vox"])
+    g = opts.get("body_ct_gate")
+    if g is not None:
+        if isinstance(g, bool) or not isinstance(g, (int, float)) or not 0 <= float(g) <= 255:
+            raise ValueError(f"extra.train.body_ct_gate must be null or a CT threshold in [0, 255], got {g!r}")
+        if opts["surface_mode"] not in ("body", "sides"):
+            raise ValueError("extra.train.body_ct_gate needs extra.train.surface_mode 'body' or 'sides'")
+        opts["body_ct_gate"] = float(g)
     from tsm.data import WINDING_SOURCES
 
     if opts["winding_source"] not in WINDING_SOURCES:
@@ -495,7 +517,8 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
         raise ValueError(f"unknown extra.train.surface_aux keys: {unknown} "
                          f"(known: {sorted(SURFACE_AUX_DEFAULTS)})")
     out = {**SURFACE_AUX_DEFAULTS, **raw}
-    for k in ("shell", "crest", "far", "shell_margin", "crest_tol", "far_margin", "gap", "gap_tau", "cldice"):
+    for k in ("shell", "crest", "far", "shell_margin", "crest_tol", "far_margin", "gap", "gap_tau", "cldice",
+              "gap_class", "gap_border_weight", "eikonal", "eikonal_min_d"):
         v = out[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) < 0:
             raise ValueError(f"extra.train.surface_aux.{k} must be a non-negative number, got {v!r}")
@@ -505,6 +528,16 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
         if isinstance(r, bool) or not isinstance(r, (int, float)) or int(r) < 1:
             raise ValueError(f"extra.train.surface_aux.{k} must be an integer >= 1, got {r!r}")
         out[k] = int(r)
+    d = out["gap_dilate"]
+    if isinstance(d, bool) or not isinstance(d, (int, float)) or int(d) < 0:
+        raise ValueError(f"extra.train.surface_aux.gap_dilate must be an integer >= 0, got {d!r}")
+    out["gap_dilate"] = int(d)
+    if out["gap_class"] > 0 and surface_mode != "sides":
+        raise ValueError("extra.train.surface_aux.gap_class needs extra.train.surface_mode='sides' "
+                         "(it is a dedicated head channel of that mode)")
+    if (out["gap_border_weight"] > 0 or out["eikonal"] > 0) and surface_mode != "sides":
+        raise ValueError("extra.train.surface_aux.gap_border_weight / eikonal need "
+                         "extra.train.surface_mode='sides'")
     if out["gap"] > 0 and out["gap_tau"] <= 0:
         raise ValueError("extra.train.surface_aux.gap_tau must be > 0 when gap > 0")
     if surface_aux_active(out) and surface_mode not in ("faces", "body", "sides"):
@@ -522,7 +555,9 @@ def surface_aux_opts(raw: Any, surface_mode: str = "faces") -> dict[str, Any]:
 
 def surface_aux_active(aux: Mapping[str, Any] | None) -> bool:
     """True when at least one auxiliary surface weight is non-zero (per-face *or* body terms)."""
-    return bool(aux) and any(float(aux.get(k, 0.0)) > 0.0 for k in ("shell", "crest", "far", "gap", "cldice"))
+    return bool(aux) and any(float(aux.get(k, 0.0)) > 0.0
+                             for k in ("shell", "crest", "far", "gap", "cldice", "gap_class",
+                                       "gap_border_weight", "eikonal"))
 
 
 def augment_mode(opts: dict[str, Any]) -> tuple[str, Any]:
@@ -677,9 +712,99 @@ def body_mask(t_in: torch.Tensor, t_out: torch.Tensor | None = None,
     return inside.float() * m
 
 
-def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int) -> torch.Tensor:
-    """``close_radius(body) * (1 - body) * m1`` -- the thin air gaps a weld would fill."""
-    return _close(body_t, radius) * (1.0 - body_t) * m1
+def narrow_gap_mask(body_t: torch.Tensor, m1: torch.Tensor, radius: int, dilate: int = 0) -> torch.Tensor:
+    """``close_radius(body) * (1 - body) * m1`` -- the thin air gaps a weld would fill.
+
+    ``dilate > 0`` (``extra.train.surface_aux.gap_dilate``) grows that mask by a cube of
+    ``dilate`` voxels and then removes the body again, so the protected air widens by a voxel
+    or two on each side without ever covering labelled papyrus: the bias is deliberately toward
+    *under*-connection (a hair too much "keep this apart" is cheaper than a weld).  ``dilate=0``
+    returns exactly the historical mask."""
+    gap = _close(body_t, radius) * (1.0 - body_t) * m1
+    if int(dilate) > 0:
+        gap = _dilate(gap, int(dilate)) * (1.0 - body_t) * m1
+    return gap
+
+
+def gap_border_mask(body_t: torch.Tensor, gap_t: torch.Tensor, dilate: int = 0) -> torch.Tensor:
+    """The gap voxels that *touch* a body -- a cheap stand-in for Ronneberger's border weight map.
+
+    U-Net (Ronneberger et al. 2015) weights a voxel by ``w0 * exp(-(d1 + d2)^2 / (2 sigma^2))``
+    with ``d1``, ``d2`` the distances to the two nearest *different* objects, which needs two
+    full distance transforms per crop.  The voxels that map keeps are exactly the thin air
+    between two bodies, close to both -- and here the thin air is already known
+    (:func:`narrow_gap_mask`), so the approximation is a single morphological test::
+
+        border = gap * dilate_{dilate + 1}(body)
+
+    i.e. the label-gap voxels whose (chebyshev) distance to the nearest body is <=
+    ``gap_dilate + 1``.  It is 0/1 rather than a smooth bump; the caller scales it by
+    ``surface_aux.gap_border_weight`` (the ``w0``) and adds it to the loss mask."""
+    return gap_t * _dilate(body_t, int(dilate) + 1)
+
+
+def _central_diff(x: torch.Tensor) -> torch.Tensor:
+    """Central finite differences of a (B, 1, Z, Y, X) field -> (B, 3, Z, Y, X), voxel units.
+
+    Replicate padding, so the 1-voxel border carries a half-width difference; every caller
+    excludes that border from its mask."""
+    p = F.pad(x, (1, 1, 1, 1, 1, 1), mode="replicate")
+    dz = (p[:, :, 2:, 1:-1, 1:-1] - p[:, :, :-2, 1:-1, 1:-1]) * 0.5
+    dy = (p[:, :, 1:-1, 2:, 1:-1] - p[:, :, 1:-1, :-2, 1:-1]) * 0.5
+    dx = (p[:, :, 1:-1, 1:-1, 2:] - p[:, :, 1:-1, 1:-1, :-2]) * 0.5
+    return torch.cat([dz, dy, dx], dim=1)
+
+
+def _interior(x: torch.Tensor) -> torch.Tensor:
+    """0/1 mask that is 0 on the 1-voxel border of the crop (where central differences are half)."""
+    m = torch.zeros_like(x)
+    m[:, :, 1:-1, 1:-1, 1:-1] = 1.0
+    return m
+
+
+def _ridge_mask(g: torch.Tensor) -> torch.Tensor:
+    """Voxels a central difference of the LABEL distance changes sign *across*, along any axis.
+
+    An unsigned distance field is |grad| = 1 everywhere except on the faces (where it is 0, a
+    minimum) and on the medial ridge of the sheet and of the air gap (a maximum): at both the
+    derivative along some axis flips sign from one neighbour to the other.  ``g`` is
+    :func:`_central_diff` of the label field; the test is ``g[i-1] * g[i+1] < 0`` per axis."""
+    p = F.pad(g, (1, 1, 1, 1, 1, 1), mode="replicate")
+    cz = p[:, 0:1, 2:, 1:-1, 1:-1] * p[:, 0:1, :-2, 1:-1, 1:-1]
+    cy = p[:, 1:2, 1:-1, 2:, 1:-1] * p[:, 1:2, 1:-1, :-2, 1:-1]
+    cx = p[:, 2:3, 1:-1, 1:-1, 2:] * p[:, 2:3, 1:-1, 1:-1, :-2]
+    return ((cz < 0) | (cy < 0) | (cx < 0)).float()
+
+
+def eikonal_term(p_d: torch.Tensor, t_d: torch.Tensor, m1: torch.Tensor,
+                 weight: float, min_d: float = 3.0) -> torch.Tensor:
+    """``mean over the eikonal mask of (|grad d_pred| - 1)^2`` (sides mode only), times ``weight``.
+
+    ``d_face`` is an UNSIGNED distance to the nearest sheet face, so the true field satisfies
+    the eikonal equation ``|grad d| = 1`` almost everywhere -- everywhere except three sets,
+    all of which the mask removes:
+
+    * **near the faces** -- label ``d_face <= eikonal_min_d`` (the gaussian-weighted L1 already
+      owns that band, and the field has a kink at the face itself),
+    * **saturated labels** -- label ``d_face >= clip - 1``, where the store clipped the distance
+      flat (gradient 0).  The clip is not passed in; it is read off the batch as the maximum
+      label distance over supervised voxels, which *is* ``extra.labels.clip`` whenever anything
+      in the batch saturates,
+    * **the medial ridge** -- the locus where the nearest face switches and the distance has a
+      local maximum along some axis.  Approximated by :func:`_ridge_mask` (a central difference
+      of the *label* field changing sign across the voxel) dilated by a cube of radius 2, which
+      covers the "within 1.5 voxels of a sign change" band the plan asks for.
+
+    plus the 1-voxel crop border, where the replicate-padded central difference is halved.  The
+    gradient is central finite differences in voxel units (:func:`_central_diff`); the mean is
+    taken over the mask (``masked_mean``), so an empty mask contributes exactly 0."""
+    g_t = _central_diff(t_d)
+    clip = float(t_d.mul(m1 > 0).max()) if float((m1 > 0).sum()) > 0 else 0.0
+    m = (m1 > 0).float() * _interior(t_d)
+    m = m * (t_d > float(min_d)).float() * (t_d < clip - 1.0).float()
+    m = m * (1.0 - _dilate(_ridge_mask(g_t), 2))
+    gm = _central_diff(p_d).pow(2).sum(dim=1, keepdim=True).clamp_min(EPS).sqrt()
+    return float(weight) * masked_mean((gm - 1.0) ** 2, m)
 
 
 def soft_body(p_in: torch.Tensor, p_out: torch.Tensor | None = None, tau: float = 2.0,
@@ -725,7 +850,8 @@ def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor | None, t_in: tor
                        t_out: torch.Tensor | None,
                        mv: torch.Tensor, m1: torch.Tensor, aux: Mapping[str, Any],
                        p_body: torch.Tensor | None = None,
-                       t_body: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+                       t_body: torch.Tensor | None = None,
+                       p_gap: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """Optional *body* terms of ``extra.train.surface_aux`` (``gap``, ``cldice``), both off by default.
 
     Unlike ``shell`` / ``crest`` / ``far`` (:func:`surface_aux_terms`, one face at a time) these
@@ -774,18 +900,37 @@ def surface_body_terms(p_in: torch.Tensor, p_out: torch.Tensor | None, t_in: tor
 
     In ``surface_mode="sides"`` the body is a head of its own: pass the already-sigmoided body
     probability as ``p_body`` and the 0/1 label body as ``t_body`` (``tsm.data.body_mask_np``)
-    and neither ``tau`` nor the SDF channels are consulted at all.
+    and neither ``tau`` nor the SDF channels are consulted at all.  That mode can also supervise
+    the gap *explicitly*: ``gap_dilate`` widens the label gap mask both terms use
+    (:func:`narrow_gap_mask`) and, with ``p_gap`` (the 4th surface head channel) and a non-zero
+    ``gap_class`` weight, the mask becomes a classification target of its own::
+
+        gap_class * (BCE_with_logits(p_gap, gap_mask) + soft_dice(sigmoid(p_gap), gap_mask))
+
+    both masked by ``valid == 1`` (times ``faces_weight``).
 
     Returned values are already multiplied by their weight, so the caller just sums them."""
     out: dict[str, torch.Tensor] = {}
     w_gap, w_cld = float(aux.get("gap", 0.0)), float(aux.get("cldice", 0.0))
-    if w_gap <= 0 and w_cld <= 0:
+    w_gc = float(aux.get("gap_class", 0.0)) if p_gap is not None else 0.0
+    if w_gap <= 0 and w_cld <= 0 and w_gc <= 0:
         return out
+    dil = int(aux.get("gap_dilate", 0))
+    rad = int(aux.get("gap_radius", 3))
     body_t = body_mask(t_in, t_out, mv, mask=t_body)   # label side: hard, no gradients
     if w_gap > 0:
         tau = float(aux.get("gap_tau", 2.0))
-        gap_m = narrow_gap_mask(body_t, m1, int(aux.get("gap_radius", 3)))
+        gap_m = narrow_gap_mask(body_t, m1, rad, dil)
         out["gap"] = w_gap * per_sample_mean(soft_body(p_in, p_out, tau, prob=p_body), gap_m)
+    if w_gc > 0:
+        # the same label gap mask, now as a 0/1 TARGET for a head channel of its own (sides
+        # mode): BCE + soft Dice on valid == 1, exactly the pair the ink / body heads use.
+        # Making the air an explicit class gives the net a gradient that says "this is a gap"
+        # instead of only "do not put body here".
+        gap_t = narrow_gap_mask(body_t, mv, rad, dil)
+        out["gap_class"] = w_gc * (
+            masked_mean(F.binary_cross_entropy_with_logits(p_gap, gap_t, reduction="none"), m1)
+            + soft_dice(torch.sigmoid(p_gap), gap_t, m1))
     if w_cld > 0:
         iters = int(aux.get("cldice_iters", 5))
         tau = float(aux.get("gap_tau", 2.0))
@@ -905,27 +1050,53 @@ def sides_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
     ``aux`` (``extra.train.surface_aux``) adds the zero-set terms of :func:`surface_aux_terms`
     on the face distance (``shell_face`` / ``crest_face`` / ``far_face``) and the body topology
     terms of :func:`surface_body_terms` (``gap``, ``cldice``) evaluated on the *predicted body
-    probability* ``sigmoid(body logit)`` and the 0/1 label body."""
+    probability* ``sigmoid(body logit)`` and the 0/1 label body.  Three more terms exist only
+    here: ``gap_class`` (a 4th head channel classified against the label air gap,
+    :func:`surface_body_terms`), ``gap_border_weight`` (a Ronneberger-style extra weight on the
+    gap voxels that touch a body, :func:`gap_border_mask`, folded into the ``sdf_l1`` /
+    ``body_bce`` masks) and ``eikonal`` (``(|grad d_pred| - 1)^2`` away from the faces, the
+    label clip and the medial ridge, :func:`eikonal_term`).  All default to 0."""
     if pred.shape[1] < 3 or sdf.shape[1] != 1 or body.shape[1] != 1:
         raise ValueError(f"sides mode needs a 3-channel surface head and 1-channel d_face / body "
                          f"targets, got {tuple(pred.shape)} / {tuple(sdf.shape)} / {tuple(body.shape)}")
     p_d, p_b, p_v = pred[:, 0:1].float(), pred[:, 1:2].float(), pred[:, 2:3].float()
+    aux = aux or {}
+    w_gc = float(aux.get("gap_class", 0.0))
+    if w_gc > 0 and pred.shape[1] < 4:
+        raise ValueError(f"surface_aux.gap_class needs the 4-channel sides head "
+                         f"[d_face, body, valid, gap], got {tuple(pred.shape)}")
+    p_g = pred[:, 3:4].float() if pred.shape[1] > 3 else None
     mv = (valid == 1).float()
     m1 = _weighted(mv, weight)
     m_not2 = _weighted((valid != 2).float(), weight)
     w = 1.0 + SDF_WMAX * torch.exp(-(sdf ** 2) / (2.0 * SDF_SIGMA ** 2))
+    # Ronneberger-style border weight map: the label-gap voxels that touch a body get
+    # `gap_border_weight` added to the mask of the two dense terms (d_face L1, body BCE), so a
+    # voxel in the thin air between two wraps counts for (1 + w0) of an ordinary voxel.  With
+    # the weight at 0 (the default) `m_b` IS `m1`, so the arithmetic is bit-identical.
+    w_border = float(aux.get("gap_border_weight", 0.0))
+    m_b = m1
+    if w_border > 0:
+        body_t = body_mask(sdf, None, mv, mask=body)
+        dil = int(aux.get("gap_dilate", 0))
+        gap_t = narrow_gap_mask(body_t, mv, int(aux.get("gap_radius", 3)), dil)
+        m_b = m1 * (1.0 + w_border * gap_border_mask(body_t, gap_t, dil))
     out: dict[str, torch.Tensor] = {
-        "sdf_l1": masked_mean(w * (p_d - sdf).abs(), m1),
+        "sdf_l1": masked_mean(w * (p_d - sdf).abs(), m_b),
         "band_dice": surface_band_dice(p_d, sdf, m1),
-        "body_bce": masked_mean(F.binary_cross_entropy_with_logits(p_b, body, reduction="none"), m1),
+        "body_bce": masked_mean(F.binary_cross_entropy_with_logits(p_b, body, reduction="none"), m_b),
         "body_dice": soft_dice(torch.sigmoid(p_b), body, m1),
         "valid_bce": masked_mean(
             F.binary_cross_entropy_with_logits(p_v, (valid == 1).float(), reduction="none"), m_not2),
     }
     if surface_aux_active(aux):
-        out.update(surface_aux_terms(p_d, sdf, mv, m1, aux or {}, "face"))
-        out.update(surface_body_terms(p_b, None, sdf, None, mv, m1, aux or {},
-                                      p_body=torch.sigmoid(p_b), t_body=body))
+        out.update(surface_aux_terms(p_d, sdf, mv, m1, aux, "face"))
+        out.update(surface_body_terms(p_b, None, sdf, None, mv, m1, aux,
+                                      p_body=torch.sigmoid(p_b), t_body=body,
+                                      p_gap=p_g if w_gc > 0 else None))
+        w_eik = float(aux.get("eikonal", 0.0))
+        if w_eik > 0:
+            out["eikonal"] = eikonal_term(p_d, sdf, m1, w_eik, float(aux.get("eikonal_min_d", 3.0)))
     return out
 
 
@@ -1759,6 +1930,7 @@ def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], aug
         input_axis=bool(opts.get("input_axis", True)),
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
         axis_tangent=bool(opts.get("axis_tangent", True)),
+        body_ct_gate=opts.get("body_ct_gate"),
     )
     return ds, train_o, hold_o
 
@@ -1848,6 +2020,7 @@ def build_dataset(cfg: RunCfg, opts: dict[str, Any], augment: bool = True):
         input_axis=bool(opts.get("input_axis", True)),
         core_radius_vox=float(opts.get("core_radius_vox", 0.0) or 0.0),
         axis_tangent=bool(opts.get("axis_tangent", True)),
+        body_ct_gate=opts.get("body_ct_gate"),
     )
     ds.holdout_origins = hold_o
     print(f"[tsm] {len(ds.origins)} crop origins (patch {ds.patch}, stride {opts['stride']}, coarse factor {ds.factor}), "
@@ -1882,7 +2055,9 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     smode = str(opts["surface_mode"])
     do_fiber = bool(opts["heads"]["fiber"])
     fmode = str(opts["fiber_mode"])
-    heads = heads_for(smode, do_fiber, fmode)
+    # extra.train.surface_aux.gap_class > 0 widens the sides surface head by one channel
+    gap_cls = float((opts.get("surface_aux") or {}).get("gap_class", 0.0)) > 0
+    heads = heads_for(smode, do_fiber, fmode, gap_cls)
     radial = bool(opts["input_radial"])
     ax_in = bool(opts["input_axis"])
     ax_tan = bool(opts["axis_tangent"])
@@ -1890,7 +2065,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     model = build_model(widths=widths, in_ch=n_in, compile=bool(opts["compile"]), act_ckpt=int(opts["act_ckpt"]),
                         channels_last=cl, surface_mode=smode, body_stride=int(opts["body_stride"]),
                         fullres_width=int(opts["fullres_width"]), norm=str(opts["norm"]), fiber=do_fiber,
-                        fiber_mode=fmode).to(device)
+                        fiber_mode=fmode, gap_class=gap_cls).to(device)
     n_params = _unwrap(model).num_params()
     print(f"[tsm] TSMNet widths={widths} params={n_params / 1e6:.2f}M surface_mode={smode} heads={heads} "
           f"in_ch={n_in} {input_channels(radial, ax_in)} device={device} channels_last={cl} "
@@ -2009,6 +2184,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
                    "body_stride": int(opts["body_stride"]), "fullres_width": int(opts["fullres_width"]),
                    "norm": str(opts["norm"]),
                    "input_radial": radial, "input_axis": ax_in, "axis_tangent": ax_tan, "fiber_mode": fmode,
+                   "gap_class": gap_cls,
                    "in_ch": n_in, "axis_path": opts["axis_path"], "region": [list(cfg.region.start_zyx), list(cfg.region.size_zyx)], "volume": cfg.volume.__dict__}
 
     aug_mode, aug_spec = augment_mode(opts)

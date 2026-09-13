@@ -69,6 +69,7 @@ import hashlib
 import json
 import math
 import os
+import time
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -803,6 +804,7 @@ class CropDataset(Dataset):
         input_axis: bool = False,
         core_radius_vox: float = 0.0,
         axis_tangent: bool = True,
+        body_ct_gate: float | None = None,
     ) -> None:
         self.surface_mode = str(surface_mode)
         self.input_radial = bool(input_radial)
@@ -816,6 +818,10 @@ class CropDataset(Dataset):
         self.core_radius_vox = float(core_radius_vox or 0.0)
         if self.core_radius_vox < 0:
             raise ValueError(f"core_radius_vox must be >= 0, got {core_radius_vox!r}")
+        # extra.train.body_ct_gate: CT threshold (RAW uint8 units) under which a label-body
+        # voxel stops supervising the surface targets -- see :meth:`load`.  None = off.
+        self.body_ct_gate = None if body_ct_gate is None else float(body_ct_gate)
+        self._ct_gate_crops = 0
         self._axis_spec = axis
         self.axis: np.ndarray | None = None  # loaded below, once fiber/fiber_mode are known
         self.patch = int(patch)
@@ -925,6 +931,38 @@ class CropDataset(Dataset):
         a[0] = 1.0
         return {"radial": radial_field(self.axis, origin_global_zyx, shape, scale=1), "axis_dir": a}
 
+    #: how often the CT gate prints its ``surface/ct_gated_frac`` summary (crops, per worker)
+    CT_GATE_LOG_EVERY = 256
+
+    def _ct_gate(self, ct: np.ndarray, sv: np.ndarray, t: dict[str, np.ndarray]) -> np.ndarray:
+        """``faces_valid`` with the CT-dark part of the label body turned into 2 = ignore.
+
+        ``extra.train.body_ct_gate`` is a threshold in RAW uint8 CT units (e.g. 60).  The crop's
+        CT is gaussian-smoothed with sigma 2 voxels (on the *un-augmented* crop, one
+        ``scipy.ndimage.gaussian_filter`` per crop, ~10 ms at patch 128) and every voxel the
+        label calls papyrus body -- ``surface_body`` in "sides" mode, ``surface_sdf > 0`` in
+        "body" mode -- whose smoothed CT is below the threshold is marked ``2`` (ignore), so it
+        supervises neither ``surface_sdf`` nor ``surface_body`` (both loss masks are built from
+        ``surface_valid``).  Air the face labels swallowed (a closed crack, a torn wrap) stops
+        teaching the net that air is papyrus.  The label store is never modified.
+
+        The gated fraction (of supervised voxels) is printed for the first crop of each worker
+        and every :data:`CT_GATE_LOG_EVERY` crops after it, as ``surface/ct_gated_frac``."""
+        from scipy.ndimage import gaussian_filter
+
+        t0 = time.perf_counter()
+        sm = gaussian_filter(ct.astype(np.float32), 2.0)
+        body = (t["surface_body"][0] > 0) if self.surface_mode == "sides" else (t["surface_sdf"][0] > 0)
+        dark = body & (sm < float(self.body_ct_gate)) & (sv > 0)
+        out = np.where(dark, 2.0, sv.astype(np.float32))
+        self._ct_gate_crops += 1
+        if self._ct_gate_crops == 1 or self._ct_gate_crops % self.CT_GATE_LOG_EVERY == 0:
+            sup = float((sv > 0).sum())
+            print(f"[tsm] surface/ct_gated_frac {(float(dark.sum()) / sup if sup else 0.0):.4f} "
+                  f"(body_ct_gate={self.body_ct_gate:g}, crop {self._ct_gate_crops}, "
+                  f"{1e3 * (time.perf_counter() - t0):.1f} ms)", flush=True)
+        return out
+
     def load(self, origin_local: Sequence[int]) -> dict[str, Any]:
         """Un-augmented sample at a local fine-store origin: ct (1,P,P,P) in [0,1] + targets."""
         store = self.fine
@@ -955,6 +993,8 @@ class CropDataset(Dataset):
         else:
             sv = store.read("sdf_valid", z0, y0, x0, P)
             t["surface_sdf"][0] = np.where(sv > 0, decode_sdf(store.read("sdf", z0, y0, x0, P)), 0.0)
+        if self.body_ct_gate is not None and self.surface_mode in ("body", "sides"):
+            sv = self._ct_gate(ct, sv, t)
         t["surface_valid"][0] = sv
         if self.surface_weight:
             # 0 is "never written" (a brick the appender did not reach), not "weight 0":
@@ -1172,7 +1212,7 @@ class MultiStoreDataset(Dataset):
             if d.coarse is not None and d0.coarse is not None and d.coarse.channels != d0.coarse.channels:
                 raise ValueError(f"store {name!r} has coarse channels {d.coarse.channels} != {d0.coarse.channels}")
             for attr in ("patch", "surface_mode", "winding_source", "fiber", "fiber_mode", "input_radial", "input_axis",
-                         "axis_tangent"):
+                         "axis_tangent", "body_ct_gate"):
                 if getattr(d, attr) != getattr(d0, attr):
                     raise ValueError(f"store {name!r} has {attr}={getattr(d, attr)!r} != {getattr(d0, attr)!r}")
             if d.target_keys != d0.target_keys:
