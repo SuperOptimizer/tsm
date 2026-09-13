@@ -77,7 +77,10 @@ __all__ = [
     "student_rf_radius",
     "rf_tiling",
     "extract_surface",
+    "extract_sides",
+    "SIDES_EXTRACT_DEFAULTS",
     "write_surface_channel",
+    "rederive_sides",
     "write_fiber_class_channels",
     "run_infer",
     "pool_mean",
@@ -106,7 +109,8 @@ N_BODY_HEAD_CH = 11
 # the nearest face, the sheet-body probability and the validity -- so the export / TRT layout is
 # identical to the two-face one.  `d_face` is written with the SAME byte encoding as any SDF
 # (128 + clip(d)*127/clip), so an existing sdf reader decodes it as a non-negative distance; the
-# derived `surface_side1` is the 2-voxel shell `d_face <= 1` (both sides of every face at once).
+# derived `surface_side1` is the robust side set of `extract_sides` (the body skin united with
+# the in-body face-distance valleys), NOT a threshold on the compressed `d_face`.
 # No thickness channel: the mode names no sides.
 SIDES_PRED_CHANNELS = ["d_face", "body", "valid", "ink", "sin", "cos", "density", "nx", "ny", "nz", "conf",
                        "spare", "surface_side1"]
@@ -800,6 +804,62 @@ def extract_surface(sdf_u8: np.ndarray, valid_u8: np.ndarray, clip: float) -> np
     return neg & _any6(pos) & (np.asarray(valid_u8) >= 128)
 
 
+#: :func:`extract_sides` defaults, recorded in the store attrs as ``surface_side1_params``.
+SIDES_EXTRACT_DEFAULTS = {"body_thr": 0.5, "valley_tol": 0.5, "valley_max": 3.0, "min_component": 0}
+
+
+def extract_sides(d_face: np.ndarray, body: np.ndarray, valid: np.ndarray, *, body_thr: float = 0.5,
+                  valley_tol: float = 0.5, valley_max: float = 3.0, min_component: int = 0) -> np.ndarray:
+    """The sheet **sides** of a ``surface_mode="sides"`` prediction, from the body mask and the
+    face-distance *valleys* -- never from a threshold on the distance itself.
+
+    All inputs are physical float arrays of the same shape: ``d_face`` in voxels (unsigned
+    distance to the nearest sheet face), ``body`` and ``valid`` probabilities in [0, 1].
+
+    The regressed unsigned distance of a trained student is systematically **compressed**: it
+    saturates a couple of voxels above 0 and never reaches the faces (the classic UDF failure),
+    so the old pointwise rule ``d_face <= 1`` can select nothing at all while the body head is
+    perfectly clean.  The robust side set is therefore the union of
+
+    (a) the **body skin**: voxels with ``body >= body_thr`` that have a 6-neighbour below the
+        threshold.  The skin is taken on the *papyrus* side of the body boundary (the side
+        voxel is sheet, not air), the same convention as :func:`extract_surface`, which keeps
+        the non-positive (inside) side of the zero crossing;
+
+    (b) the **distance valley**: voxels inside the body where ``d_face`` is a local minimum
+        (``d_face - minimum_filter(d_face, 3) <= valley_tol``) and small (``<= valley_max``).
+        Inside a body a valley is a *contact plane* between two merged sheets -- the faces the
+        body mask alone cannot see, because the merged sheets share one body component.
+        Valleys in air are ignored (they are the medial surface of the gap, not a face).
+
+    Everything is restricted to ``valid >= 0.5``; ``min_component > 0`` drops 26-connected
+    components smaller than that many voxels.
+
+    Pure function on plain arrays and local by one voxel (a 6-neighbourhood and a 3^3 minimum
+    filter), so brick-wise callers only need a 1-voxel halo -- which is exactly what
+    :func:`write_surface_channel` already reads.  (``min_component`` is the one non-local
+    option: it labels the array it is given, so a brick-wise caller should leave it at 0 and
+    prune components on the assembled volume instead.)"""
+    from scipy import ndimage as ndi
+
+    d = np.asarray(d_face, dtype=np.float32)
+    b = np.asarray(body, dtype=np.float32)
+    v = np.asarray(valid, dtype=np.float32)
+    inside = b >= float(body_thr)
+    skin = inside & _any6(~inside)          # body-side skin: the side voxel is papyrus
+    valley = inside & (d <= float(valley_max))
+    if valley.any():
+        valley &= (d - ndi.minimum_filter(d, size=3, mode="nearest")) <= float(valley_tol)
+    out = (skin | valley) & (v >= 0.5)
+    if int(min_component) > 0 and out.any():
+        lab, n = ndi.label(out, structure=np.ones((3, 3, 3), bool))
+        if n:
+            keep = np.bincount(lab.ravel(), minlength=n + 1) >= int(min_component)
+            keep[0] = False
+            out = keep[lab]
+    return out
+
+
 def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
                                log: Callable[[str], None] | None = None, axis: Any = None,
                                origin_zyx: Sequence[int] | None = None) -> dict[str, Any]:
@@ -870,7 +930,8 @@ def write_fiber_class_channels(pred_path: str, clip: float, brick: int = 128,
 
 
 def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_box: Sequence[int] = (256, 512, 512),
-                          min_component: int = 100, log: Callable[[str], None] | None = None) -> dict[str, Any]:
+                          min_component: int = 100, log: Callable[[str], None] | None = None,
+                          sides_params: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Fill the thin-surface channel(s) (and, in the two-face mode, ``thickness``) in pred.zarr
     brick-wise (1-voxel halo, edge replicated); stats on the central box.
 
@@ -878,12 +939,15 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
     ``surface_out1`` from ``sdf_out`` and ``thickness`` = round(clip(sdf_in - sdf_out, 0, 255))
     (the gap between the two zero sets, in voxels, 0 outside the sheet / no data).  Body mode:
     ``surface_body1`` from ``sdf_body`` and no thickness pass (the body SDF names no sides).
-    Sides mode: ``surface_side1`` = ``(d_face <= 1) & (valid >= 0.5)``, a 2-voxel-thick shell
-    around every face (pointwise -- an unsigned distance has no zero crossing to extract), and
-    again no thickness pass."""
+    Sides mode: ``surface_side1`` from :func:`extract_sides` (the body skin united with the
+    face-distance valleys inside the body; ``sides_params`` overrides its keywords and is
+    recorded in the store attrs as ``surface_side1_params``), and again no thickness pass.
+    A threshold on the regressed ``d_face`` is deliberately NOT used: it is compressed and
+    never reaches 0 at the faces."""
     log = log or (lambda m: print(m, flush=True))
     arr = zarr.open_array(store=pred_path, mode="r+")
     ch = list(arr.attrs["channels"])
+    sp = {**SIDES_EXTRACT_DEFAULTS, **dict(sides_params or {})}
     faces = "sdf_in" in ch
     sides = "d_face" in ch
     if faces:
@@ -895,9 +959,13 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
     else:
         pairs = [("surface1", "sdf")]
     ival = ch.index("valid")
+    ibody = ch.index("body") if sides else None
     shape = tuple(int(s) for s in arr.shape[1:])
     t0 = time.perf_counter()
     out: dict[str, Any] = {"seconds": 0.0}
+    if sides:
+        out["surface_side1_params"] = dict(sp)
+        arr.attrs["surface_side1_params"] = dict(sp)
     for surf_name, sdf_name in pairs:
         ci, isdf = ch.index(surf_name), ch.index(sdf_name)
         n_surf = n_data = 0
@@ -906,11 +974,15 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
             sdf_box = read_box_padded(arr, lo_h, hi_h, channels=isdf)[0]
             val_box = read_box_padded(arr, lo_h, hi_h, channels=ival)[0]
             if sides:
-                # no zero CROSSING to find: d_face is unsigned, so the sheet sides are the
-                # 2-voxel-thick shell d_face <= 1 (pointwise, both sides of every face at once,
-                # matching the 2-voxel tolerance of the upstream Dice)
-                surf = ((sdf_box != 0) & (decode_sdf(sdf_box, clip) <= 1.0)
-                        & (val_box >= 128))[1:-1, 1:-1, 1:-1]
+                # no zero CROSSING to find (d_face is unsigned) and no usable threshold on it
+                # either (it is compressed and never reaches 0): the sides are the body skin
+                # plus the in-body distance valleys -- see `extract_sides`.  The 1-voxel halo
+                # read above is exactly the neighbourhood it needs.
+                bod_box = read_box_padded(arr, lo_h, hi_h, channels=ibody)[0]
+                surf = (extract_sides(decode_sdf(sdf_box, clip), decode_prob(bod_box),
+                                      decode_prob(val_box), **sp)
+                        & (sdf_box != 0))[1:-1, 1:-1, 1:-1]
+                del bod_box
             else:
                 surf = extract_surface(sdf_box, val_box, clip)[1:-1, 1:-1, 1:-1]
             n_surf += int(surf.sum())
@@ -950,6 +1022,23 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
         log(f"[infer] thickness (voxels): {out['thickness']}")
     out["seconds"] = time.perf_counter() - t0
     return out
+
+
+def rederive_sides(pred_path: str, clip: float = CLIP, brick: int = 128,
+                   stats_box: Sequence[int] = (256, 512, 512), min_component: int = 100,
+                   log: Callable[[str], None] | None = None, **sides_params: Any) -> dict[str, Any]:
+    """Recompute ``surface_side1`` **in place** in an existing sides ``pred.zarr``.
+
+    Same pass as the sides branch of :func:`write_surface_channel` (from ``d_face`` / ``body`` /
+    ``valid``), so a run whose sides were written by an older, weaker rule can be re-scored
+    without re-running the network.  ``sides_params`` are the :func:`extract_sides` keywords."""
+    arr = zarr.open_array(store=pred_path, mode="r")
+    ch = list(arr.attrs["channels"])
+    if not ("d_face" in ch and "body" in ch and "surface_side1" in ch):
+        raise ValueError(f"{pred_path} is not a sides store (channels={ch})")
+    del arr
+    return write_surface_channel(pred_path, float(clip), brick=brick, stats_box=stats_box,
+                                 min_component=min_component, log=log, sides_params=sides_params)
 
 
 # --------------------------------------------------------------------------- #
@@ -1164,7 +1253,9 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
             "body": "sigmoid * 255: P(this voxel is papyrus body) (sides mode)",
             "gap": ("sigmoid * 255: P(this voxel is the thin air gap between two sheets) "
                     "(sides mode, surface_aux.gap_class)"),
-            "surface_side1": "255 where d_face <= 1 and valid >= 0.5 (sides mode)",
+            "surface_side1": ("255 on the sheet sides of `extract_sides`: the body-side skin of "
+                              "`body >= 0.5` united with the face-distance valleys inside the body, "
+                              "restricted to valid >= 0.5 (sides mode)"),
             "lsd_off_z|lsd_off_y|lsd_off_x": (f"127.5 + 127.5 * off/(2*{clip:g}): the offset (voxels) to "
                                               f"the centre plane of the voxel's own sheet (heads.lsd)"),
             "lsd_thick": "round(clip(thickness, 0, 255)) voxels, the windowed sheet thickness (heads.lsd)",

@@ -419,7 +419,7 @@ class StudentSource(Source):
     def read(self, origin: Sequence[int], dims: Sequence[int], budget: Budget) -> Iterator[tuple[Layer, np.ndarray]]:
         from tsm.cli import open_ct
         from tsm.config import RegionCfg
-        from tsm.infer import extract_surface
+        from tsm.infer import extract_sides, extract_surface
         from tsm.limits import free_cuda
         from tsm.sliding import run_sliding
         from tsm.student import normalize_ct
@@ -439,6 +439,12 @@ class StudentSource(Source):
                           ("surface_body1", "sdf_body")):
             if surf in self.channels and sdf in vals:
                 vals[surf] = (extract_surface(vals[sdf], val, self.clip).astype(np.uint8) * 255)
+        if "surface_side1" in self.channels and "d_face" in vals and "body" in vals:
+            from tsm.data import decode_prob, decode_sdf
+
+            sides = extract_sides(decode_sdf(vals["d_face"], self.clip), decode_prob(vals["body"]),
+                                  decode_prob(val)) & (vals["d_face"] != 0)
+            vals["surface_side1"] = sides.astype(np.uint8) * 255
         if "thickness" in self.channels and "sdf_in" in vals and "sdf_out" in vals:
             from tsm.data import decode_sdf
 

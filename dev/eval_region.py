@@ -870,7 +870,9 @@ def body_pred_mask(pred: Store, lo, hi, clip: float, valid_min: int = 128) -> np
 
 
 def body_surface_mask(pred: Store, lo, hi) -> np.ndarray:
-    """The predicted thin **sheet-side** mask, unordered: ``surface_side1`` for a sides store,
+    """The predicted thin **sheet-side** mask, unordered: ``surface_side1`` for a sides store
+    (written by :func:`tsm.infer.extract_sides`; ``--rederive-sides`` refreshes it in place
+    from ``d_face`` / ``body`` / ``valid`` before scoring, for stores written by an older rule),
     ``surface_body1`` for a body store,
     ``surface_in1 | surface_out1`` for a two-face store (the union forgets which side is which,
     which is exactly what the upstream recto/verso union is scored against)."""
@@ -1608,6 +1610,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                     help="fine.zarr of a faces label store (default: <out_dir>/labels/fine.zarr, "
                          "else <out_dir>_labels/labels/fine.zarr, else no faces label metrics)")
     ap.add_argument("--slices", type=int, default=3)
+    ap.add_argument("--rederive-sides", action="store_true",
+                    help="recompute surface_side1 in place in the prediction store (sides mode) "
+                         "from d_face/body/valid with tsm.infer.extract_sides before scoring")
     ap.add_argument("--rectoverso", default=None,
                     help="rectoverso.zarr (dev/rectoverso_slab.py) -> the teacher-independent "
                          "`upstream_faces` / `upstream_body` blocks: the student's surfaces vs "
@@ -1644,6 +1649,17 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     for n, s in [("pred", pred), ("fine", fine), ("coarse", coarse), ("faces_labels", flab)] + list(stores.items()):
         log(f"{n}: " + (f"{s.path} shape={s.shape} origin={s.origin} channels={s.channels}" if s else "missing"))
     log(f"surface mode: {'faces' if faces_mode else ('body' if body_mode else ('sides' if sides_mode else 'medial'))}")
+    if a.rederive_sides:
+        if not sides_mode:
+            log("WARNING --rederive-sides ignored: the prediction store has no d_face channel")
+        else:
+            from tsm.infer import rederive_sides
+
+            log(f"re-deriving surface_side1 in {pred.path} (extract_sides)")
+            r = rederive_sides(pred_path, clip, brick=128, log=log)
+            log(f"surface_side1: {r['n_voxels']} voxels ({r['frac_of_data']:.4f} of data), "
+                f"params {r['surface_side1_params']}")
+            pred = open_store(pred_path)          # reopen: the channel changed under us
     if a.faces_labels and not (faces_mode or free_mode):
         log("WARNING --faces-labels ignored: the prediction store has no sdf_in/sdf_out channels")
 

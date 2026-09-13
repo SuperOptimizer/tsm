@@ -519,11 +519,17 @@ def test_run_infer_writes_surface_side1_and_body(tmp_path):
     arr = zarr.open_array(store=os.path.join(root, "student", "pred.zarr"), mode="r")
     assert list(arr.attrs["channels"]) == SIDES_PRED_CHANNELS
     a = np.asarray(arr[:])
-    i_d, i_v, i_s = (SIDES_PRED_CHANNELS.index(k) for k in ("d_face", "valid", "surface_side1"))
+    i_d, i_s = (SIDES_PRED_CHANNELS.index(k) for k in ("d_face", "surface_side1"))
     assert int(a[i_d][a[i_d] != 0].min()) >= 128         # the distance never encodes negative
     dec = decode_pred(a, CLIP, SIDES_PRED_CHANNELS)
-    want = (a[i_d] != 0) & (dec["d_face"] <= 1.0) & (a[i_v] >= 128)
+    # the derived side channel is `extract_sides` (body skin U in-body distance valleys), not a
+    # threshold on the compressed distance
+    from tsm.infer import extract_sides
+
+    want = extract_sides(dec["d_face"], dec["body"], dec["valid"]) & (a[i_d] != 0)
     np.testing.assert_array_equal(a[i_s] > 127, want)
+    assert not (a[i_s] > 127)[dec["body"] < 0.5].any()   # sides lie on the papyrus side
+    assert dict(arr.attrs["surface_side1_params"])["body_thr"] == 0.5
     assert "body" in dec and float(dec["body"].min()) >= 0.0 and float(dec["body"].max()) <= 1.0
     sj = json.load(open(os.path.join(root, "student", "pred.summary.json")))
     assert sj["surface_mode"] == "sides" and "surface_side1" in sj["surface1"]
