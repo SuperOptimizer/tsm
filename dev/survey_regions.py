@@ -236,10 +236,11 @@ def best_xy_start(counts2d: np.ndarray | None, cell0: int, umb_yx0: tuple[float,
 
 
 def propose(sv: Survey, k: int, depth: int, xy: int, floor: float,
-            max_shift_frac: float = 0.5, align: int = ALIGN) -> list[dict]:
+            max_shift_frac: float = 0.5, align: int = ALIGN,
+            extra_excl: list[tuple[int, int]] | None = None) -> list[dict]:
     depth = align_down(depth, align) or align
     xy = align_down(xy, align) or align
-    excl = exclusion_intervals(depth)
+    excl = exclusion_intervals(depth) + list(extra_excl or [])
     starts, scores = slab_scores(sv.occ, sv.scale, depth, align)
     zs = choose_starts(starts, scores, k, depth, floor, excl)
     out: list[dict] = []
@@ -407,14 +408,15 @@ def thumbnails(reader: VolumeReader, sv: Survey, props: list[dict], nsl: int = 4
     return out
 
 
-def write_configs(base_path: str, props: list[dict], root: str, cfg_dir: str, log=print) -> list[str]:
+def write_configs(base_path: str, props: list[dict], root: str, cfg_dir: str, log=print,
+                  prefix: str = "paris4_r") -> list[str]:
     with open(base_path) as fh:
         base = json.load(fh)
     os.makedirs(cfg_dir, exist_ok=True)
     paths = []
     for p in props:
         cfg = json.loads(json.dumps(base))
-        name = f"paris4_r{p['k']}"
+        name = f"{prefix}{p['k']}"
         out_dir = os.path.join(root, name)
         cfg["region"] = {"start_zyx": list(p["start_zyx"]), "size_zyx": list(p["size_zyx"])}
         cfg["out_dir"] = out_dir
@@ -448,6 +450,10 @@ def main(argv=None) -> int:
     ap.add_argument("--threshold", type=int, default=60)
     ap.add_argument("--sigma", type=float, default=1.0)
     ap.add_argument("--floor", type=float, default=0.05, help="min slice occupancy fraction")
+    ap.add_argument("--zmin", type=int, default=0, help="level-0 z below which no slab is proposed")
+    ap.add_argument("--zmax", type=int, default=0, help="level-0 z above which no slab is proposed (0 = none)")
+    ap.add_argument("--exclude", default="", help="extra level-0 z intervals to avoid, 'z0:z1,z0:z1'")
+    ap.add_argument("--name-prefix", default="paris4_r", help="config/out_dir name prefix for proposals")
     ap.add_argument("--max-shift-frac", type=float, default=0.5)
     ap.add_argument("--zchunk", type=int, default=128, help="survey z-slices per read")
     ap.add_argument("--cell", type=int, default=4, help="survey voxels per coarse xy cell")
@@ -486,7 +492,15 @@ def main(argv=None) -> int:
         np.savez_compressed(npz, occ=sv.occ, bbox=sv.bbox, umb=sv.umb,
                             counts=sv.counts, cell=sv.cell)
 
-    props = propose(sv, args.k, args.depth, args.xy, args.floor, args.max_shift_frac)
+    extra: list[tuple[int, int]] = []
+    if args.zmin > 0:
+        extra.append((0, int(args.zmin)))
+    if args.zmax > 0:
+        extra.append((int(args.zmax), 10 ** 9))
+    for tok in [t for t in args.exclude.split(",") if t.strip()]:
+        a, b = tok.split(":")
+        extra.append((int(a), int(b)))
+    props = propose(sv, args.k, args.depth, args.xy, args.floor, args.max_shift_frac, extra_excl=extra)
     payload = survey_payload(sv, props, args)
     with open(os.path.join(out, "survey.json"), "w") as fh:
         json.dump(payload, fh, indent=1)
@@ -501,7 +515,7 @@ def main(argv=None) -> int:
           f"max cross-section (y, x) {tuple(ext['max_cross_section_yx_l0'])} level-0 voxels")
     print(f"wrote {out}/survey.json and {out}/survey.png")
     if args.write_configs:
-        write_configs(args.base_config, props, args.region_root, args.config_dir)
+        write_configs(args.base_config, props, args.region_root, args.config_dir, prefix=args.name_prefix)
     return 0
 
 

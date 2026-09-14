@@ -8,9 +8,9 @@
   },
   "region": {
     "start_zyx": [
-      18752,
-      11648,
-      8192
+      39616,
+      11264,
+      14976
     ],
     "size_zyx": [
       256,
@@ -24,7 +24,7 @@
     "vram_frac": 0.8,
     "min_avail_mb": 2048
   },
-  "out_dir": "/home/forrest/tsm-output/regions/paris4_r2",
+  "out_dir": "/home/forrest/tsm-output/regions/paris4_s1",
   "extra": {
     "teacher": {
       "models": [
@@ -58,14 +58,14 @@
         0.65
       ],
       "ct_mask_threshold": 30,
-      "teachers_dir": "/home/forrest/tsm-output/regions/paris4_r2/teachers",
+      "teachers_dir": "/home/forrest/tsm-output/regions/paris4_s1/teachers",
       "require_teachers": [],
       "faces": {
         "enabled": true,
         "body_threshold": 80.0,
         "close_radius": 6.0,
         "source": "rectoverso",
-        "rectoverso_store": "/home/forrest/tsm-output/regions/paris4_r2/rectoverso/rectoverso.zarr",
+        "rectoverso_store": "/home/forrest/tsm-output/regions/paris4_s1/rectoverso/rectoverso.zarr",
         "side_reach": 3.0,
         "min_thickness": 10.0
       },
@@ -95,8 +95,8 @@
         "every": 2
       },
       "input_radial": true,
-      "fine_store": "/home/forrest/tsm-output/regions/paris4_r2/labels/fine.zarr",
-      "coarse_store": "/home/forrest/tsm-output/regions/paris4_r2/labels/coarse.zarr",
+      "fine_store": "/home/forrest/tsm-output/regions/paris4_s1/labels/fine.zarr",
+      "coarse_store": "/home/forrest/tsm-output/regions/paris4_s1/labels/coarse.zarr",
       "ink_pos_weight": 5.0,
       "loss_weights": {
         "surface": 1.0,
