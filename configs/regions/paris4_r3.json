@@ -19,8 +19,8 @@
     ]
   },
   "budget": {
-    "ram_bytes": 8589934592,
-    "array_bytes": 2147483648,
+    "ram_bytes": 25769803776,
+    "array_bytes": 4294967296,
     "vram_frac": 0.8,
     "min_avail_mb": 2048
   },
@@ -28,10 +28,7 @@
   "extra": {
     "teacher": {
       "models": [
-        "recto",
-        "ink",
-        "lasagna",
-        "m7@l2"
+        "lasagna"
       ],
       "out_tile": 384,
       "halo": 128,
@@ -61,6 +58,7 @@
       ],
       "ct_mask_threshold": 30,
       "teachers_dir": "/home/forrest/tsm-output/regions/paris4_r3/teachers",
+      "require_teachers": [],
       "faces": {
         "enabled": true,
         "body_threshold": 80.0,
