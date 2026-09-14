@@ -834,7 +834,7 @@ Layout of villa `preprocess_cos_omezarr.run_preprocess_3d` as if the lasagna mod
 Applied on the device per collated batch, after the DataLoader and before the per-crop z-score
 (`train.model_input`); written in torch, every transform truly 3D, each independently switchable
 via `AugmentConfig` (`extra.train.augment` = `true` (= preset `"strong"`), a preset name
-`"strong" | "strong_scan" | "light" | "none"`, a dict `{"preset": ..., "<transform>": {"p": ..., ...}}` (unknown keys
+`"strong" | "strong_scan" | "strong_volcomp" | "light" | "none"`, a dict `{"preset": ..., "<transform>": {"p": ..., ...}}` (unknown keys
 rejected), `"v1"` for the old CPU flips/rot90 + jitter path, or `false`).  The number of samples
 each transform touched per optimizer step is logged as `aug/<name>` in `log.jsonl`.
 
@@ -898,6 +898,31 @@ and the non-CT input channels are untouched, exactly as for the rest of the inte
 `configs/ablate_augment.json` sweeps `base` (= `strong`) / `none` / `geo_only` (every intensity
 transform at p=0, geometry kept) / `strong_scan` / `strong_seed1` (`base` with
 `extra.train.seed` 1, i.e. the seed-to-seed noise floor of the comparison) over 6000 steps.
+
+### volcomp round trip (CPU, preset `strong_volcomp`)
+The training CT may be read from the lossy volcomp mirror (`q = 8`: |Δ| mean ≈ 3 grey levels,
+p99 11, a structured, edge-aligned residual — `dev/volcomp_check.py`,
+`~/tsm-output/volcomp_check.json`).  The `volcomp` family feeds the **real codec residual** into
+training: with probability `p` the raw uint8 crop is encoded and decoded again at a random
+`q ∈ [q_min, q_max]`, so a student trained on the lossless volume still sees mirror-like inputs
+(and vice versa).
+
+```json
+"augment": {"preset": "strong_volcomp", "volcomp": {"p": 0.3, "q": [4.0, 12.0]}}
+```
+
+Defaults `{"p": 0.0, "q": [4.0, 12.0]}` (off, so `strong` is unchanged); the preset
+`strong_volcomp` is exactly `strong` plus `volcomp: {"p": 0.3}`.  Unlike every other intensity
+transform this one runs **on the CPU in the dataset worker** (`data.CropDataset.load`, via
+`data.volcomp_roundtrip`), because the codec is C code over uint8 bytes — it is applied to the
+raw crop, before the float conversion, the z-score and the whole GPU pipeline, and the targets
+are never touched.  The codec encodes 128³ z-major blocks only, so any other crop size is
+edge-padded to a multiple of 128, tiled and cropped back; one 128³ crop costs ≈ 4 ms.  Only the
+training path (`__getitem__`, which owns a per-sample generator) augments — a direct `load()`
+(the held-out evaluation, `--overfit-one`) never does.  `p > 0` without the `volcomp_zarr`
+package importable raises at config time.  The per-step fire count is logged as `aug/volcomp`
+like the rest of the family (it rides along with the batch as `volcomp_q`, since it does not
+fire inside `Augment`).  `tests/test_volcomp_aug.py`.
 
 **Holdout and evaluation.** `extra.train.holdout_origins` (`{"z_frac": f}`, `{"z_range": [lo, hi]}`
 or an explicit list of local origins; `data.split_holdout`) removes crops from training (training

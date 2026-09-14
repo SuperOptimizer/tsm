@@ -10,6 +10,7 @@ import torch
 
 from tsm.data import (
     CLIP,
+    CPU_NAMES,
     INTENSITY_NAMES,
     PRESETS,
     SCAN_NAMES,
@@ -242,7 +243,8 @@ def test_none_preset_is_identity_and_strong_has_no_nans():
         assert torch.equal(o["input"][:, 1], b["input"][:, 1])  # scale channel untouched
         assert o["surface_sdf"].abs().max() <= CLIP
     assert tot["artefact"] == 0 and sum(tot[k] for k in SPATIAL_NAMES) > 0 and sum(tot[k] for k in INTENSITY_NAMES) > 0
-    assert set(fired) == set(TRANSFORM_NAMES)
+    # CPU_NAMES (volcomp) fire in the dataset worker, so Augment never reports them
+    assert set(fired) == set(TRANSFORM_NAMES) - set(CPU_NAMES)
 
 
 def test_augment_is_seeded_and_deterministic():

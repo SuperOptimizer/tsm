@@ -62,7 +62,10 @@ into the checkpoint config so ``tsm infer`` rebuilds the same input.
 Augmentation: ``extra.train.augment`` = True ("strong"), a preset name, a dict (``data.AugmentConfig``),
 "v1" (the CPU flips/rot90 + jitter path) or False.  v2 runs on the device per batch after the
 DataLoader (``data.Augment``); the number of samples each transform touched per optimizer step
-is logged as ``aug/<name>`` in log.jsonl.  ``holdout_origins`` holds crops out of training
+is logged as ``aug/<name>`` in log.jsonl.  The one exception is the ``volcomp`` family (preset
+"strong_volcomp"), which round-trips the raw uint8 crop through the lossy CT-mirror codec on the
+CPU in the dataset worker -- its ``aug/volcomp`` count rides along with the batch.
+``holdout_origins`` holds crops out of training
 (``data.split_holdout``); the EMA model is scored on them at the end (``evaluate`` ->
 ``holdout_metrics.json``).
 
@@ -570,6 +573,21 @@ def surface_aux_active(aux: Mapping[str, Any] | None) -> bool:
     return bool(aux) and any(float(aux.get(k, 0.0)) > 0.0
                              for k in ("shell", "crest", "far", "gap", "cldice", "gap_class",
                                        "gap_border_weight", "eikonal"))
+
+
+def volcomp_spec(opts: dict[str, Any]):
+    """``extra.train.augment``'s ``volcomp`` family (``data.VolcompCfg``) or None when it is off.
+
+    The codec round trip is the one intensity transform that does NOT run in ``Augment``: it
+    works on the raw uint8 crop, so it is applied on the CPU in the dataset worker and has to
+    be handed to the dataset instead of to the GPU pipeline."""
+    mode, spec = augment_mode(opts)
+    if mode != "v2":
+        return None
+    from tsm.data import as_augment_config
+
+    vc = as_augment_config(spec).volcomp
+    return vc if float(vc.p) > 0 else None
 
 
 def augment_mode(opts: dict[str, Any]) -> tuple[str, Any]:
@@ -1986,6 +2004,7 @@ def _store_dataset(cfg: RunCfg, opts: dict[str, Any], entry: dict[str, Any], aug
         body_ct_gate=opts.get("body_ct_gate"),
         lsd=bool((opts.get("heads") or {}).get("lsd", False)),
         lsd_sigma=float(opts.get("lsd_sigma", 6.0)),
+        volcomp=volcomp_spec(opts),
     )
     return ds, train_o, hold_o
 
@@ -2078,6 +2097,7 @@ def build_dataset(cfg: RunCfg, opts: dict[str, Any], augment: bool = True):
         body_ct_gate=opts.get("body_ct_gate"),
         lsd=bool((opts.get("heads") or {}).get("lsd", False)),
         lsd_sigma=float(opts.get("lsd_sigma", 6.0)),
+        volcomp=volcomp_spec(opts),
     )
     ds.holdout_origins = hold_o
     print(f"[tsm] {len(ds.origins)} crop origins (patch {ds.patch}, stride {opts['stride']}, coarse factor {ds.factor}), "
@@ -2307,6 +2327,10 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
         want_gn = measure or (gl_every > 0 and ((step + 1) % gl_every == 0 or step == 0))
         for ai in range(A):
             batch = to_device(next(batches), device)
+            if "volcomp_q" in batch:
+                # the codec round trip fires in the dataset worker (CPU, on the raw uint8
+                # crop), so its count comes with the batch rather than from aug(batch)
+                acc["aug/volcomp"] = acc.get("aug/volcomp", 0.0) + float((batch["volcomp_q"] > 0).sum())
             if aug is not None:
                 batch, fired = aug(batch)
                 for k, v in fired.items():

@@ -1000,6 +1000,7 @@ class CropDataset(Dataset):
         body_ct_gate: float | None = None,
         lsd: bool = False,
         lsd_sigma: float = LSD_SIGMA,
+        volcomp: Any = None,
     ) -> None:
         self.surface_mode = str(surface_mode)
         self.input_radial = bool(input_radial)
@@ -1031,6 +1032,17 @@ class CropDataset(Dataset):
         self.seed = int(seed)
         self.length = int(length)
         self.do_augment = bool(augment)
+        # extra.train.augment volcomp family: the lossy-codec round trip of the raw uint8 crop,
+        # applied here (CPU, in the worker) because the codec is C code over uint8 bytes.
+        # None / p = 0 = off.  A p > 0 without the codec installed raises in VolcompCfg.
+        if volcomp is None or isinstance(volcomp, VolcompCfg):
+            self.volcomp = volcomp
+        elif isinstance(volcomp, dict):
+            self.volcomp = _from_dict(VolcompCfg, volcomp, "augment.volcomp")
+        else:
+            raise ValueError(f"volcomp must be a VolcompCfg, a dict or None, got {type(volcomp).__name__}")
+        if self.volcomp is not None and float(self.volcomp.p) <= 0:
+            self.volcomp = None
         self.fine = LabelStore(fine_store) if isinstance(fine_store, str) else fine_store
         self.coarse = LabelStore(coarse_store) if isinstance(coarse_store, str) else coarse_store
         self.factor = store_factor(self.fine, self.coarse) if self.coarse is not None else 1
@@ -1166,7 +1178,22 @@ class CropDataset(Dataset):
                   f"{1e3 * (time.perf_counter() - t0):.1f} ms)", flush=True)
         return out
 
-    def load(self, origin_local: Sequence[int]) -> dict[str, Any]:
+    def _volcomp(self, ct: np.ndarray, rng: np.random.Generator | None) -> tuple[np.ndarray, float]:
+        """With probability ``volcomp.p``, the lossy codec round trip of the raw uint8 crop.
+
+        Returns ``(ct, q)`` with ``q = 0`` when the transform did not fire (``ct`` untouched,
+        so ``p = 0`` is bit-identical to no volcomp at all).  ``rng = None`` -- every direct
+        ``load()`` call, i.e. the held-out evaluation and ``--overfit-one`` -- never augments:
+        only the training ``__getitem__`` path, which owns a per-sample generator, does."""
+        c = self.volcomp
+        if c is None or rng is None:
+            return ct, 0.0
+        if float(rng.random()) >= float(c.p):
+            return ct, 0.0
+        q = float(rng.uniform(float(c.q[0]), float(c.q[1])))
+        return volcomp_roundtrip(ct, q), q
+
+    def load(self, origin_local: Sequence[int], rng: np.random.Generator | None = None) -> dict[str, Any]:
         """Un-augmented sample at a local fine-store origin: ct (1,P,P,P) in [0,1] + targets."""
         store = self.fine
         P = self.patch
@@ -1276,12 +1303,17 @@ class CropDataset(Dataset):
             t["radial"] = frame["radial"]
         if self.input_axis:
             t["axis_dir"] = frame["axis_dir"]
+        # the codec round trip is the LAST thing done to the raw uint8 crop: after every label
+        # read (the targets must not move) and before the float conversion / z-scoring
+        ct, vq = self._volcomp(ct, rng)
         sample: dict[str, Any] = {
             "ct": (ct.astype(np.float32) / 255.0)[None],
             "voxel_um": float(store.voxel_um),
             "scale_value": scale_channel_value(store.voxel_um),
             "origin_zyx": (gz, gy, gx),
         }
+        if self.volcomp is not None:
+            sample["volcomp_q"] = vq  # 0 = did not fire; logged as aug/volcomp by the trainer
         sample.update(t)
         return sample
 
@@ -1299,6 +1331,8 @@ class CropDataset(Dataset):
             "voxel_um": torch.tensor(float(sample["voxel_um"])),
             "origin_zyx": torch.tensor(sample["origin_zyx"], dtype=torch.int64),
         }
+        if "volcomp_q" in sample:
+            out["volcomp_q"] = torch.tensor(float(sample["volcomp_q"]))
         # NOT just TARGET_KEYS: the optional fiber targets (present iff the dataset was built
         # with fiber=True) must survive the numpy -> tensor conversion too, or the fiber head
         # silently gets no supervision.
@@ -1316,7 +1350,7 @@ class CropDataset(Dataset):
         for attempt in range(self.MAX_READ_SUBSTITUTIONS + 1):
             origin = self.origins[int(rng.integers(0, len(self.origins)))]
             try:
-                sample = self.load(origin)
+                sample = self.load(origin, rng)
             except VolumeReadError as exc:
                 self.read_failures += 1
                 if attempt >= self.MAX_READ_SUBSTITUTIONS:
@@ -1473,9 +1507,9 @@ class MultiStoreDataset(Dataset):
         u = float(np.random.default_rng([self.seed, int(index), 0x5700]).random())
         return int(np.searchsorted(self._cum, u, side="right").clip(0, len(self.datasets) - 1))
 
-    def load(self, origin: Sequence[int]) -> dict[str, Any]:
+    def load(self, origin: Sequence[int], rng: np.random.Generator | None = None) -> dict[str, Any]:
         k, z0, y0, x0 = (int(v) for v in origin)
-        return self.datasets[k].load((z0, y0, x0))
+        return self.datasets[k].load((z0, y0, x0), rng)
 
     @staticmethod
     def to_tensors(sample: dict[str, Any]) -> dict[str, Any]:
@@ -1509,6 +1543,11 @@ class MultiStoreDataset(Dataset):
 #            rot90 / arbitrary rotations rotate it, anisotropic scaling tilts it like a
 #            covector)
 #   conf / ink  mask-aware trilinear
+#   volcomp  CT only, and NOT part of the GPU pipeline: the raw uint8 crop is round-tripped
+#            through the lossy volcomp codec in the dataset worker (CPU, :meth:`CropDataset.load`)
+#            before z-scoring and before every transform above -- config family
+#            ``volcomp: {"p": 0.0, "q": [4.0, 12.0]}``, off by default, on at p = 0.3 in the
+#            "strong_volcomp" preset.  Targets are never touched by it.
 # The elastic field is small; its local Jacobian is ignored for the sdf / density /
 # normal rules.  Intensity transforms touch the CT only (all 3D: anisotropic blur is a
 # separable 3D gaussian, cutout removes boxes, low-res resamples the volume, artefacts
@@ -1701,6 +1740,79 @@ class SpectralNoiseCfg:  # coloured noise: white noise filtered by |k|^(beta/2) 
     beta_hi: float = 1.0
 
 
+# --- volcomp round trip (CPU, in the dataset worker) ------------------------------------ #
+# The training CT may be read from the lossy volcomp mirror (q = 8: |d| mean ~3 grey levels,
+# p99 11, a structured, edge-aligned residual -- dev/volcomp_check.py).  This family puts the
+# REAL codec residual into the augmentation: with probability ``p`` the raw uint8 crop is
+# encoded and decoded again at a random q in ``[q[0], q[1]]``, so a student trained on the
+# lossless volume still sees mirror-like inputs (and vice versa).  Unlike every other
+# intensity transform this one runs on the CPU in the dataset worker (the codec is C code
+# over uint8 bytes), on the raw crop -- before z-scoring and before the GPU intensity family.
+VOLCOMP_CHUNK = 128  # the codec encodes 128^3 uint8 blocks only; bigger/smaller crops are tiled
+
+
+@dataclass
+class VolcompCfg:
+    p: float = 0.0
+    q: tuple[float, float] = (4.0, 12.0)  # uniform draw; the mirror itself is q = 8
+
+    def __post_init__(self) -> None:
+        self.p = float(self.p)
+        q = tuple(float(v) for v in self.q)
+        if len(q) != 2:
+            raise ValueError(f"augment.volcomp.q must be [q_min, q_max], got {self.q!r}")
+        if not 0 < q[0] <= q[1]:
+            raise ValueError(f"augment.volcomp.q must satisfy 0 < q_min <= q_max, got {list(q)}")
+        self.q = q
+        if self.p > 0 and volcomp_codec() is None:
+            raise ValueError(
+                "augment.volcomp.p > 0 but the volcomp codec is not importable: "
+                f"{_VOLCOMP_ERR}.  Install it with `uv pip install -e ~/volume-compressor/python` "
+                "(after building libvolcomp.so), or set augment.volcomp.p = 0.")
+
+
+_VOLCOMP: Any = None
+_VOLCOMP_ERR = ""
+
+
+def volcomp_codec():
+    """The ``volcomp_zarr`` module, or None when it is not importable (``_VOLCOMP_ERR`` says why)."""
+    global _VOLCOMP, _VOLCOMP_ERR
+    if _VOLCOMP is None:
+        try:
+            import volcomp_zarr  # noqa: PLC0415
+
+            _VOLCOMP = volcomp_zarr
+        except Exception as exc:  # pragma: no cover - depends on the machine
+            _VOLCOMP = False
+            _VOLCOMP_ERR = f"{type(exc).__name__}: {exc}"
+    return _VOLCOMP or None
+
+
+def volcomp_roundtrip(vol: np.ndarray, q: float) -> np.ndarray:
+    """Encode + decode a uint8 volume with volcomp at quality ``q`` (a new array, same shape).
+
+    The codec works on 128^3 z-major blocks only, so any other shape is edge-padded up to a
+    multiple of 128, tiled, and cropped back -- a 128^3 training crop is exactly one block.
+    """
+    vc = volcomp_codec()
+    if vc is None:  # pragma: no cover - guarded at config time
+        raise RuntimeError(f"volcomp codec unavailable: {_VOLCOMP_ERR}")
+    a = np.ascontiguousarray(vol, np.uint8)
+    if a.ndim != 3:
+        raise ValueError(f"volcomp_roundtrip needs a 3D uint8 volume, got shape {a.shape}")
+    C = VOLCOMP_CHUNK
+    pad = [(0, (-n) % C) for n in a.shape]
+    buf = np.pad(a, pad, mode="edge") if any(hi for _, hi in pad) else a.copy()
+    for z in range(0, buf.shape[0], C):
+        for y in range(0, buf.shape[1], C):
+            for x in range(0, buf.shape[2], C):
+                blk = np.ascontiguousarray(buf[z:z + C, y:y + C, x:x + C])
+                out = np.frombuffer(bytes(vc.decode(vc.encode(blk.tobytes(), float(q)))), np.uint8)
+                buf[z:z + C, y:y + C, x:x + C] = out.reshape((C, C, C))
+    return buf[: a.shape[0], : a.shape[1], : a.shape[2]]
+
+
 @dataclass
 class AugmentConfig:
     flip: FlipCfg = None  # type: ignore[assignment]
@@ -1723,6 +1835,7 @@ class AugmentConfig:
     ring: RingCfg = None  # type: ignore[assignment]
     stripe: StripeCfg = None  # type: ignore[assignment]
     spectral_noise: SpectralNoiseCfg = None  # type: ignore[assignment]
+    volcomp: VolcompCfg = None  # type: ignore[assignment]
     oob_fill: str = "reflection"  # CT padding for samples outside the crop: reflection | border | zeros
     clip: float = CLIP
 
@@ -1768,13 +1881,16 @@ _CFG_CLASSES: dict[str, type] = {
     "sharpen": SharpenCfg, "artefact": ArtefactCfg, "cutout": CutoutCfg, "lowres": LowResCfg,
     "window": WindowCfg, "class_contrast": ClassContrastCfg, "aniso_blur": AnisoBlurCfg,
     "ring": RingCfg, "stripe": StripeCfg, "spectral_noise": SpectralNoiseCfg,
+    "volcomp": VolcompCfg,
 }
 SPATIAL_NAMES = ("flip", "rot90", "rotate", "scale", "elastic")
 # the scan-domain family (off unless the preset turns it on), in pipeline order
 SCAN_NAMES = ("aniso_blur", "class_contrast", "spectral_noise", "ring", "stripe", "window")
 INTENSITY_NAMES = ("lowres", "blur", "aniso_blur", "sharpen", "class_contrast", "gamma", "contrast",
                    "mult_noise", "noise", "spectral_noise", "ring", "stripe", "window", "artefact", "cutout")
-TRANSFORM_NAMES = SPATIAL_NAMES + INTENSITY_NAMES
+# transforms applied on the CPU in the dataset worker (on the raw uint8 crop), not by ``Augment``
+CPU_NAMES = ("volcomp",)
+TRANSFORM_NAMES = SPATIAL_NAMES + INTENSITY_NAMES + CPU_NAMES
 
 
 def _from_dict(cls: type, d: Any, path: str):
@@ -1812,6 +1928,8 @@ PRESETS: dict[str, dict[str, Any]] = {
     # PHercParis4 and PHercParis3 at 2.4 um (see the comments above the dataclasses)
     "strong_scan": {"window": {"p": 0.5}, "class_contrast": {"p": 0.4}, "aniso_blur": {"p": 0.3},
                     "spectral_noise": {"p": 0.3}, "ring": {"p": 0.2}, "stripe": {"p": 0.05}},
+    # strong + the real lossy-codec residual of the volcomp CT mirror (CPU, per crop)
+    "strong_volcomp": {"volcomp": {"p": 0.3}},
 }
 
 
@@ -2431,7 +2549,10 @@ class Augment:
         # (tsm.dino.DinoFeatSource reads its targets from a cache) can see what fired
         self.last_params = params
         out = self.apply_spatial(batch, params)
-        fired = {n: 0 for n in TRANSFORM_NAMES}
+        # CPU_NAMES (volcomp) fire in the dataset worker, not here: they are deliberately absent
+        # from this dict (the trainer counts them from the batch), which also keeps the
+        # generator stream and the reported counts of every preset bit-identical.
+        fired = {n: 0 for n in TRANSFORM_NAMES if n not in CPU_NAMES}
         for p in params:
             for k, v in p.fired.items():
                 fired[k] += int(v)
@@ -2442,7 +2563,8 @@ class Augment:
 
     def describe(self) -> str:
         c = self.cfg
-        return ", ".join(f"{n}:p={float(getattr(c, n).p):g}" for n in TRANSFORM_NAMES if float(getattr(c, n).p) > 0) or "identity"
+        return ", ".join(f"{n}:p={float(getattr(c, n).p):g}{' (cpu, in the dataset worker)' if n in CPU_NAMES else ''}"
+                         for n in TRANSFORM_NAMES if float(getattr(c, n).p) > 0) or "identity"
 
 
 
@@ -2452,7 +2574,8 @@ __all__ = [
     "SURFACE_MODES", "body_sdf", "face_dist", "body_mask_np", "SURFACE_BODY_KEY", "WINDING_CH", "FIBER_MODES", "FIBER_TARGET_KEYS", "FIBER_BAND_WEIGHT", "BAND_CHANNEL",
     "LabelStore", "CropDataset", "MultiStoreDataset", "build_origins", "augment", "spatial_transform", "intensity_augment",
     "Augment", "AugmentConfig", "SpatialParams", "PRESETS", "TRANSFORM_NAMES", "SPATIAL_NAMES", "INTENSITY_NAMES",
-    "SCAN_NAMES", "WindowCfg", "ClassContrastCfg", "AnisoBlurCfg", "RingCfg", "StripeCfg", "SpectralNoiseCfg",
+    "SCAN_NAMES", "CPU_NAMES", "WindowCfg", "ClassContrastCfg", "AnisoBlurCfg", "RingCfg", "StripeCfg", "SpectralNoiseCfg",
+    "VolcompCfg", "volcomp_roundtrip", "volcomp_codec", "VOLCOMP_CHUNK",
     "as_augment_config", "apply_overrides", "load_axis_spec", "rot90_matrix_inplane", "rotation_matrix", "split_holdout",
     "upsample_coarse_targets", "store_factor",
     "decode_sdf", "encode_sdf", "decode_signed", "encode_signed", "decode_density", "encode_density",
