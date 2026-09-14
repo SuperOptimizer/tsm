@@ -720,7 +720,7 @@ def fiber_upstream_pass(pred: Store, band: Store, band_channel: str, lo, hi, cli
         from tsm.data import load_axis_spec
 
         ax_pts = load_axis_spec(axis)
-    sdf_ch = next((k for k in ("sdf_in", "sdf_body", "sdf") if pred.has(k)), "sdf")
+    sdf_ch = next((k for k in ("sdf_in", "sdf_body", "d_face", "sdf") if pred.has(k)), "sdf")
     has_dir = all(pred.has(c) for c in ("fiber_dz", "fiber_dy", "fiber_dx", "fiber_strength"))
     n_hit = n_band = 0
     angs: list[np.ndarray] = []
