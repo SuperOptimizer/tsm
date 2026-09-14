@@ -1354,7 +1354,10 @@ class MultiStoreDataset(Dataset):
 
     Every store must expose the *same* channel set (identical fine channel lists, and either
     all or none with a coarse store, again with identical channels) and the same target
-    layout -- a mixed batch has to be a single supervision contract.
+    layout -- a mixed batch has to be a single supervision contract.  The one exception is the
+    optional fibre block (:data:`FIBER_CHANNELS`): a store built without a ``fiber.zarr``
+    teacher may lack it and then trains with ``fiber_valid = 0`` (pass ``fiber=True`` to every
+    ``CropDataset``, i.e. ``extra.train.heads.fiber``, so the target layout still matches).
 
     Origins are carried as ``(N, 4)`` ``[store_index, z, y, x]`` (local to that store's fine
     store) in :attr:`origins` / :attr:`holdout_origins`; :meth:`load` and :meth:`to_tensors`
@@ -1417,13 +1420,28 @@ class MultiStoreDataset(Dataset):
         h = self._tag(hold)
         self.holdout_origins = h[np.random.default_rng(self.seed).permutation(len(h))] if len(h) else h
 
+    @staticmethod
+    def _required_channels(channels: Sequence[str]) -> list[str]:
+        """Channel list minus the blocks a store may legitimately lack.
+
+        Only the fibre block is optional: :class:`CropDataset` already turns a store without it
+        into ``fiber_valid = 0`` targets (fully masked), so a slab whose teachers dir had no
+        ``fiber.zarr`` can train next to one that had it.  Everything else must match exactly --
+        a mixed batch is one supervision contract.
+        """
+        return [c for c in channels if c not in FIBER_CHANNELS]
+
     def _check_compatible(self) -> None:
         d0 = self.datasets[0]
         for name, d in zip(self.names[1:], self.datasets[1:]):
-            if d.fine.channels != d0.fine.channels:
+            if self._required_channels(d.fine.channels) != self._required_channels(d0.fine.channels):
                 raise ValueError(
                     f"store {name!r} has fine channels {d.fine.channels} but store {self.names[0]!r} has "
                     f"{d0.fine.channels}; every store must carry the same channel set")
+            if d.fine.channels != d0.fine.channels:
+                print(f"[tsm] WARNING store {name!r} channels {d.fine.channels} differ from "
+                      f"{self.names[0]!r} ({d0.fine.channels}) only in {list(FIBER_CHANNELS)}; the "
+                      f"store without them trains with fiber_valid = 0", flush=True)
             if (d.coarse is None) != (d0.coarse is None):
                 raise ValueError(f"store {name!r} {'has no' if d.coarse is None else 'has a'} coarse store but "
                                  f"{self.names[0]!r} does{'' if d0.coarse is None else ' not'}")
@@ -1432,7 +1450,10 @@ class MultiStoreDataset(Dataset):
             for attr in ("patch", "surface_mode", "winding_source", "fiber", "fiber_mode", "input_radial", "input_axis",
                          "axis_tangent", "body_ct_gate", "lsd", "lsd_sigma"):
                 if getattr(d, attr) != getattr(d0, attr):
-                    raise ValueError(f"store {name!r} has {attr}={getattr(d, attr)!r} != {getattr(d0, attr)!r}")
+                    hint = ("; the stores carry different fiber channels -- set extra.train.heads.fiber "
+                            "to force the fibre targets on every store (one without the channels then "
+                            "trains with fiber_valid = 0)" if attr == "fiber" else "")
+                    raise ValueError(f"store {name!r} has {attr}={getattr(d, attr)!r} != {getattr(d0, attr)!r}{hint}")
             if d.target_keys != d0.target_keys:
                 raise ValueError(f"store {name!r} has target keys {d.target_keys} != {d0.target_keys}")
 

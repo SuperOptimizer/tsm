@@ -174,6 +174,53 @@ def test_run_train_multi_store_reports_per_store_metrics(two, tmp_path):
     assert np.load(os.path.join(root, "train", "holdout.npy")).shape[1] == 4
 
 
+def test_run_train_with_a_store_lacking_ink_and_fibre_supervision(tmp_path):
+    """A slab built without the ink and fibre teachers (ink_valid = 0 everywhere, no
+    ``fiber_*`` channels) trains next to a full one: the masked heads simply get no gradient
+    from it and every loss stays finite."""
+    import zarr
+
+    from tsm.train import run_train
+
+    root = str(tmp_path / "mix")
+    a = make_synthetic(str(tmp_path / "fa"), fine_origin=(16, 32, 32), seed=0, fiber=True)
+    b = make_synthetic(str(tmp_path / "fb"), fine_origin=(32, 16, 16), seed=1)  # no fiber block
+    # "no ink teacher": ink = 0 and ink_valid = 0 over the whole store (tsm.labels writes this
+    # when ink.zarr is absent and extra.labels.require_teachers does not list it)
+    fb = zarr.open_array(store=b["fine"], mode="r+")
+    ch = list(fb.attrs["channels"])
+    fb[ch.index("ink")] = 0
+    fb[ch.index("ink_valid")] = 0
+
+    e = {"steps": 2, "patch": 32, "batch": 2, "accum": 1, "widths": [8, 16, 16, 16, 16],
+         "ckpt_every": 2, "num_workers": 0, "stride": 16, "log_every": 1, "warmup": 1,
+         "augment": False, "eval_max_crops": 2, "_ct": a["ct"], "heads": {"fiber": True},
+         "balance": "scale", "balance_warmup": 1, "holdout_origins": {"z_frac": 0.5},
+         "stores": [
+             {"name": "a", "fine_store": a["fine"], "coarse_store": a["coarse"],
+              "axis": _axis(100.0, 100.0), "voxel_um": 2.4},
+             {"name": "b", "fine_store": b["fine"], "coarse_store": b["coarse"],
+              "axis": _axis(60.0, 140.0), "voxel_um": 2.4,
+              "volume": {"url": b["ct"], "level": 0, "voxel_um": 2.4}},
+         ]}
+    r = run_train(_cfg(root, dict(e)))
+    rows = [json.loads(l) for l in open(os.path.join(root, "train", "log.jsonl"))]
+    steps = [d for d in rows if "step" in d and "total" in d]
+    assert len(steps) >= 2
+    for d in steps:
+        for k, v in d.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                assert np.isfinite(v), (k, v)
+        assert d["ink"] >= 0.0 and d["fiber"] >= 0.0
+    m = r["holdout"]
+    assert m["n_crops"] > 0 and m["a/n_crops"] > 0 and m["b/n_crops"] > 0
+    # store "a" is supervised on both heads; "b" has no ink positives and no fibre keys at all
+    assert np.isfinite(m["a/ink/ink_auprc"]) and np.isfinite(m["a/fiber/vt_auprc"])
+    assert np.isnan(m["b/ink/ink_auprc"])  # nothing to score, not a crash
+    assert not any(k.startswith("b/fiber/") for k in m)
+    assert np.isfinite(m["surface/sdf_mae"]) and np.isfinite(m["b/surface/sdf_mae"])
+
+
 def test_single_store_path_is_unchanged(two, tmp_path):
     """The old fine_store/coarse_store config still builds a plain CropDataset with identical items."""
     root = str(tmp_path / "single")

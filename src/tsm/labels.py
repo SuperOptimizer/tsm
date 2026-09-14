@@ -987,8 +987,21 @@ def fine_channels(faces: bool = False, fiber: bool = False, rv: bool = False,
 
 
 COARSE_CHANNELS = ["phase_sin", "phase_cos", "density", "nx", "ny", "nz", "conf", "valid"]
+#: teacher stores ``run_labels`` can read out of ``teachers_dir``.  ``lasagna`` is the coarse
+#: winding field and is always required; the other three are optional per
+#: ``extra.labels.require_teachers`` (default: recto + ink, i.e. the historical behaviour).
+TEACHER_STORES = ("recto", "ink", "fiber", "lasagna")
+OPTIONAL_TEACHERS = ("recto", "ink", "fiber")
 LABEL_DEFAULTS: dict[str, Any] = {
     "teachers_dir": None,            # default <out_dir>/teachers
+    # teacher stores that must exist in teachers_dir; anything else missing is tolerated:
+    #   recto absent -> no recto ignore band and no `recto_is_in` diagnostic, and the
+    #     recto-derived `sdf`/`sdf_valid` channels become all-ignore (sdf_valid = 2 on data),
+    #     so the faces (and their ignore mask) come from the rectoverso builder alone.
+    #     faces.source "ct" / "merge" still need recto and raise without it.
+    #   ink absent -> ink = 0 and ink_valid = 0 everywhere (the ink head is masked out).
+    #   fiber absent -> the fiber channels are simply not built (unchanged).
+    "require_teachers": ["recto", "ink"],
     "clip": 20,                      # SDF clip (level-0 voxels)
     "min_component": 100,            # drop 26-components of the recto mask smaller than this
     "recto_threshold": 0.5,
@@ -1869,6 +1882,15 @@ def _label_opts(cfg: RunCfg) -> dict[str, Any]:
         opts["halo"] = int(opts["clip"]) + 4
     if int(opts["halo"]) < int(opts["clip"]) + 2:
         raise ValueError("labels.halo must be >= clip + 2")
+    req = opts["require_teachers"]
+    if isinstance(req, str) or not isinstance(req, (list, tuple)):
+        raise ValueError("extra.labels.require_teachers must be a list of teacher names")
+    req = [str(v) for v in req]
+    bad = sorted(set(req) - set(OPTIONAL_TEACHERS))
+    if bad:
+        raise ValueError(f"unknown extra.labels.require_teachers entries {bad}; "
+                         f"choose from {list(OPTIONAL_TEACHERS)} (lasagna is always required)")
+    opts["require_teachers"] = req
     lo, hi = opts["ignore_band"]
     if not 0.0 <= lo < hi <= 1.0:
         raise ValueError("labels.ignore_band must be [lo, hi] within [0, 1]")
@@ -2078,8 +2100,9 @@ def _fine_worker_init(spec: dict[str, Any]) -> None:
     shape, origin = tuple(spec["shape"]), tuple(spec["origin"])
     w: dict[str, Any] = {
         "spec": spec, "opts": opts,
-        "recto": open_teacher(tdir, "recto", shape, origin),
-        "ink": open_teacher(tdir, "ink", shape, origin),
+        # absent (and not required) -> None; _fine_brick substitutes zeros, see run_labels
+        "recto": open_teacher(tdir, "recto", shape, origin) if spec.get("has_recto", True) else None,
+        "ink": open_teacher(tdir, "ink", shape, origin) if spec.get("has_ink", True) else None,
         "fiber": open_teacher(tdir, "fiber", shape, origin) if spec["do_fiber"] else None,
         "coarse": zarr.open_array(store=spec["coarse_path"], mode="r"),
         "ct0": open_ct(cfg, level_shift=0, probe=int(opts["probe_brick"])),
@@ -2118,8 +2141,17 @@ def _fine_brick(job: tuple[int, tuple[int, int, int], tuple[int, int, int]]) -> 
 
     hlo = [lo[a] - halo for a in range(3)]
     hhi = [hi[a] + halo for a in range(3)]
-    r_u8 = read_box_padded(w["recto"], hlo, hhi, channels=0)[0]
-    i_u8 = read_box_padded(w["ink"], hlo, hhi, channels=0)[0]
+    hshape = tuple(hhi[a] - hlo[a] for a in range(3))
+    has_recto = bool(spec.get("has_recto", True))
+    has_ink = bool(spec.get("has_ink", True))
+    # A missing teacher is an all-zero probability volume: for recto that means no mask, no
+    # medial surface and no ignore band, so build_fine_labels returns sdf = +clip with
+    # sdf_valid = 2 (ignore) wherever there is data -- the faces then come from the
+    # rectoverso builder alone.  For ink the zeros are overwritten below by ink_valid = 0.
+    r_u8 = (read_box_padded(w["recto"], hlo, hhi, channels=0)[0] if has_recto
+            else np.zeros(hshape, np.uint8))
+    i_u8 = (read_box_padded(w["ink"], hlo, hhi, channels=0)[0] if has_ink
+            else np.zeros(hshape, np.uint8))
     ct = w["ct0"].read(*(v for a in range(3) for v in (origin[a] + hlo[a], origin[a] + hhi[a])))
     rad = radial_field(w["axis"], [origin[a] + hlo[a] for a in range(3)], r_u8.shape, scale=1)
     n_up = upsample_coarse_normal(w["coarse"], hlo, hhi, scale=k)
@@ -2134,6 +2166,12 @@ def _fine_brick(job: tuple[int, tuple[int, int, int], tuple[int, int, int]]) -> 
     core = tuple(slice(halo, halo + hi[a] - lo[a]) for a in range(3))
     outs = [np.ascontiguousarray(a[core]) for a in (sdf_u8, sdf_v, ink_u8, ink_v)]
     del sdf_u8, sdf_v, ink_u8, ink_v
+    # `ink_valid` as returned by build_fine_labels is the CT data mask; the fiber block reuses
+    # it, so keep a copy before a missing ink teacher zeroes the ink channels.
+    data_core = np.ascontiguousarray(outs[3]) if do_fiber else None
+    if not has_ink:
+        outs[2] = np.zeros_like(outs[2])
+        outs[3] = np.zeros_like(outs[3])
     rv_extra: list[np.ndarray] = []
     if do_faces:
         rvb = None
@@ -2209,7 +2247,7 @@ def _fine_brick(job: tuple[int, tuple[int, int, int], tuple[int, int, int]]) -> 
         face_stats["valid_hist"] += np.bincount(outs[6].ravel(), minlength=3)[:3]
         face_stats["thickness_hist"] += np.bincount(outs[7].ravel(), minlength=256)[:256]
     if do_fiber:
-        outs += fiber_block(w["fiber"], hlo, hhi, core, outs[3])
+        outs += fiber_block(w["fiber"], hlo, hhi, core, data_core)
     del r_u8b, ctb, n_upb, radb
     v = outs[1]
     fs["valid_hist"] += np.bincount(v.ravel(), minlength=3)[:3]
@@ -2354,7 +2392,34 @@ def run_labels(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[
                   f"{2 * (halo - 2)} voxels is cut by the brick halo and its `thickness` (and the thickness "
                   f"gate) may over-read near brick edges -- raise labels.halo if that matters")
     estimate_and_assert(_coarse_budget_rows(hsc), budget)
-    has_fiber = os.path.exists(os.path.join(tdir, "fiber.zarr"))
+    # ---- which teacher stores are actually there -----------------------------
+    # `lasagna` is always required; recto / ink / fiber are optional unless listed in
+    # extra.labels.require_teachers (see LABEL_DEFAULTS for what their absence costs).
+    present = {n: os.path.exists(os.path.join(tdir, f"{n}.zarr")) for n in TEACHER_STORES}
+    require = set(opts["require_teachers"]) | {"lasagna"}
+    _llog(f"teachers_dir {tdir}: " + ", ".join(
+        f"{n}={'present' if present[n] else 'ABSENT'}" + (" (required)" if n in require else "")
+        for n in TEACHER_STORES))
+    missing = sorted(n for n in require if not present[n])
+    if missing:
+        raise FileNotFoundError(
+            f"teacher store(s) {missing} missing from {tdir} "
+            f"(required: {sorted(require)}); drop them from extra.labels.require_teachers to "
+            f"build without them")
+    has_recto, has_ink, has_fiber = present["recto"], present["ink"], present["fiber"]
+    if not has_recto:
+        src = str(opts["faces"]["source"]) if bool(opts["faces"]["enabled"]) else "ct"
+        if bool(opts["faces"]["enabled"]) and src in ("ct", "merge"):
+            raise FileNotFoundError(
+                f"extra.labels.faces.source={src!r} builds the faces from the recto teacher, but "
+                f"{os.path.join(tdir, 'recto.zarr')} is missing; use faces.source='rectoverso' or "
+                f"add recto.zarr")
+        _llog("no recto teacher store: no recto ignore band and no `recto_is_in` diagnostic; "
+              "the sdf/sdf_valid channels are all-ignore (the faces and their ignore mask come "
+              "from the rectoverso builder alone)")
+    if not has_ink:
+        _llog("no ink teacher store: ink = 0 and ink_valid = 0 everywhere (the ink head gets no "
+              "supervision from this store)")
     per_brick = estimate_and_assert(
         _fine_budget_rows(hs, bool(opts["faces"]["enabled"]), has_fiber,
                           bool(opts["faces"]["enabled"]) and str(opts["faces"]["source"]) != "ct",
@@ -2369,12 +2434,15 @@ def run_labels(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[
     os.makedirs(ldir, exist_ok=True)
     t0 = time.perf_counter()
     summary: dict[str, Any] = {"region": {"start_zyx": list(origin), "size_zyx": list(shape), "voxel_um": um},
-                               "opts": {kk: vv for kk, vv in opts.items()}, "fine": {}, "coarse": {}}
-
-    # recto/ink are opened here only to fail fast on a missing or mis-covering teacher store --
-    # the fine stage reopens them per worker process (see _fine_worker_init).
-    open_teacher(tdir, "recto", shape, origin)
-    open_teacher(tdir, "ink", shape, origin)
+                               "opts": {kk: vv for kk, vv in opts.items()}, "fine": {}, "coarse": {},
+                               "teachers": {n: ("present" if present[n] else "absent") for n in TEACHER_STORES}}
+    # recto/ink are opened here only to fail fast on a mis-covering teacher store -- the fine
+    # stage reopens them per worker process (see _fine_worker_init).  A store that is absent
+    # and not required is simply skipped (its channels are written as zeros / all-ignore).
+    if has_recto:
+        open_teacher(tdir, "recto", shape, origin)
+    if has_ink:
+        open_teacher(tdir, "ink", shape, origin)
     lasagna = open_teacher(tdir, "lasagna", shape_c, origin_c)
     # optional: the 4-class fiber teacher.  Absent -> the fiber channels are simply not built.
     if has_fiber:
@@ -2474,6 +2542,7 @@ def run_labels(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[
     face_stats: dict[str, Any] = {}
     spec = {"cfg": cfg, "opts": opts, "shape": shape, "origin": origin, "halo": halo, "clip": clip,
             "k": k, "do_faces": do_faces, "do_rv": do_rv, "do_fiber": do_fiber,
+            "has_recto": has_recto, "has_ink": has_ink,
             "do_wf": do_wf, "wf_opts": dict(opts["winding_fine"]),
             "core_radius_vox": float(opts["core_radius_vox"]),
             "face_source": face_source, "coarse_path": cw.path}

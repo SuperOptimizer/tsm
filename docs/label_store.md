@@ -10,6 +10,23 @@ Two zarr v3 uint8 stores written with `tsm.volume.BrickWriter` (shape (C,Z,Y,X),
 | 2 | ink | ink teacher prob * 255 |
 | 3 | ink_valid | 0/1 (1 inside region and CT mask) |
 
+### Optional teacher stores (`extra.labels.require_teachers`, 2026-09-13)
+
+`tsm labels` reads at most four stores out of `extra.labels.teachers_dir`: `lasagna.zarr` (the coarse
+winding field, **always required**) plus the optional `recto.zarr`, `ink.zarr` and `fiber.zarr`.
+`extra.labels.require_teachers` lists the optional ones that must exist; it defaults to
+`["recto", "ink"]` (the historical behaviour), and a slab built from the upstream recto/verso bands
+sets `[]` so only `lasagna.zarr` (+ optionally `fiber.zarr`) is needed.
+
+| absent store | effect |
+|---|---|
+| `recto` | no recto ignore band and no `recto_is_in` diagnostic (`faces.recto_is_in_mean` is `null`); the recto-derived `sdf` / `sdf_valid` channels become all-ignore (`sdf_valid = 2` wherever the CT mask holds), so the faces **and their ignore mask** come from the rectoverso builder alone. `faces.source` `"ct"` / `"merge"` still need `recto.zarr` and raise without it — only `"rectoverso"` builds. |
+| `ink` | `ink = 0` and `ink_valid = 0` everywhere, so the ink head is masked out on that store (`fiber_valid` still follows the CT data mask). |
+| `fiber` | unchanged: the fibre channels are simply not built. |
+
+`labels.summary.json` records `"teachers": {"recto": "present"/"absent", ...}`, and the dry run
+(`--dry-run`) prints the same presence/absence line before any I/O.
+
 ### Fibre-orientation labels (optional, 2026-09-06)
 
 When a `fiber.zarr` teacher store exists next to the others (`extra.labels.teachers_dir`), `tsm labels`
