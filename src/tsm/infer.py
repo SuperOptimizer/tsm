@@ -777,6 +777,11 @@ def load_student(path: str, device: str | torch.device = "cpu", widths: Sequence
                    "body_stride": kw["body_stride"], "fullres_width": kw["fullres_width"], "norm": kw["norm"],
                    "fiber": bool(kw["fiber"]), "fiber_mode": str(kw["fiber_mode"]),
                    "gap_class": bool(kw["gap_class"]), "lsd": bool(kw["lsd"]),
+                   # faces mode trained without a global in/out naming (extra.train.faces_swap_invariant):
+                   # the two channels may be consistently flipped, so every downstream rule that
+                   # combines them must be symmetric (see dev/eval_region.body_pred_mask)
+                   "faces_swap_invariant": bool(cfgb.get("faces_swap_invariant",
+                                                         tb.get("faces_swap_invariant", False))),
                    "rf_radius": int(model.receptive_field_radius())}
 
 
@@ -1004,6 +1009,9 @@ def write_surface_channel(pred_path: str, clip: float, brick: int = 128, stats_b
             f"{sb}: deg6_mean={stats.get('deg6_mean', 0):.2f} thickness_median={stats.get('thickness', {}).get('median', 0)} "
             f"components_6={stats.get('components_6', {}).get('n_components', 0)}")
     if faces:
+        # thickness = sdf_in - sdf_out needs no special case for a student trained without a face
+        # naming (extra.train.faces_swap_invariant): relabelling the two faces is negate AND swap
+        # (tsm.train.swap_faces_target), and (-sdf_out) - (-sdf_in) == sdf_in - sdf_out.
         ti, ii, io = ch.index("thickness"), ch.index("sdf_in"), ch.index("sdf_out")
         hist = np.zeros(256, np.int64)
         for lo, hi in iter_cores(shape, (brick,) * 3):
@@ -1225,6 +1233,10 @@ def run_infer(cfg: RunCfg, dry_run: bool = False, force: bool = False) -> dict[s
     finally:
         del net, model, body
         free_cuda()
+    if info.get("faces_swap_invariant"):
+        # record it on the store so the surface / thickness pass and every downstream reader
+        # (dev/eval_region) know the two face channels carry no in/out naming
+        zarr.open_array(store=pred_path, mode="r+").attrs["faces_swap_invariant"] = True
     surf = write_surface_channel(pred_path, clip, brick=int(opts["chunk"]), stats_box=opts["stats_box"],
                                  min_component=int(opts["min_component"]))
     fiber_derived = None

@@ -98,6 +98,13 @@ class Store:
         self.origin = [int(v) for v in a.get("origin_zyx", (0, 0, 0))]
         self.shape = [int(s) for s in self.arr.shape[1:]]
         self.voxel_um = float(a.get("voxel_um", 2.4))
+        self.attrs = a
+        # two-face store written by a student trained with extra.train.faces_swap_invariant:
+        # sdf_in / sdf_out carry no global naming and may be consistently flipped, so every
+        # rule that COMBINES the two channels has to be symmetric (body_pred_mask, the medial
+        # interior mask, the thickness).  Per-channel rules (surface_in1 | surface_out1) and
+        # the unordered unions already are.
+        self.swap_invariant = bool(a.get("faces_swap_invariant", False))
         self.scale = int(scale)  # fine voxels per store voxel
 
     def has(self, ch: str) -> bool:
@@ -567,7 +574,11 @@ def medial_sdf_from_faces(sdf_in_u8: np.ndarray, sdf_out_u8: np.ndarray, clip: f
     Sign convention (``labels._signed_side``): sdf_in / sdf_out are each positive on the *outward*
     side of their own face, so inside the sheet sdf_in > 0 > sdf_out (and thickness = sdf_in -
     sdf_out).  The equidistant (medial) surface is therefore the zero set of sdf_in + sdf_out,
-    whose half is the signed distance to it (exactly so for parallel faces).
+    whose half is the signed distance to it (exactly so for parallel faces).  Both the field and
+    the interior mask are invariant under relabelling the two faces (negate and swap, see
+    ``tsm.train.swap_faces_target``) up to the overall sign of the field, so the medial *zero set*
+    of a ``faces_swap_invariant`` student is the same surface (the 1-voxel crossing picks the
+    other side of it).
 
     The interior mask excludes doubly saturated voxels (:func:`face_saturated`): there the sum is
     not a distance field and the crossing would be an artefact of the clip, not geometry.  Sheets
@@ -846,7 +857,15 @@ def body_pred_mask(pred: Store, lo, hi, clip: float, valid_min: int = 128) -> np
     components).  Two-face store: the same set written in the old parametrisation,
     ``sdf_in > 0 > sdf_out`` -- which is what lets the existing faces baselines be scored with
     the orientation-free metrics without retraining.  Both are restricted to ``valid >= 128``
-    when the store carries a ``valid`` channel."""
+    when the store carries a ``valid`` channel.
+
+    The two-face rule needs no special case for a store written by a student trained without a
+    face naming (``extra.train.faces_swap_invariant``, ``Store.swap_invariant``): relabelling the
+    two faces is *negate and swap* (``tsm.train.swap_faces_target``), under which
+    ``(sdf_in > 0) & (sdf_out < 0)`` maps to ``(-sdf_out > 0) & (-sdf_in < 0)`` -- the same set.
+    A symmetric union ``| (sdf_out > 0 > sdf_in)`` would be wrong, not safer: it selects the air
+    *gap* between two sheets.  The thickness ``sdf_in - sdf_out`` is invariant for the same
+    reason, and every other two-face reader here is an unordered union already."""
     if pred.has("body"):
         need = ["body"]
     elif pred.has("sdf_body"):

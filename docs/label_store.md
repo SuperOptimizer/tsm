@@ -599,6 +599,30 @@ Choices made where the tables above are silent; the tables are unchanged.
 
   Asking for a non-zero weight in `surface_mode = "medial"` is an error, not a silent no-op.
   `configs/ablate_surface_aux.json` ablates `shell_crest` / `shell_crest_far` / `core400`.
+- **Face-swap invariance (`extra.train.faces_swap_invariant`, faces mode, default `false`).**  The
+  two-face target names its faces by a *global* outward convention (in = toward the umbilicus),
+  which no single crop reveals -- a sheet seen from the other side is the same sheet, and near the
+  core the convention degenerates outright (see the core mask below).  With the flag the loss
+  scores every sample under **both** face assignments and keeps the cheaper one
+  (`train.faces_swap_choice`, per sample, decision detached, deep supervision included), so the
+  label carries no naming.  The relabelling is **negate and swap**, `(t_in, t_out) -> (-t_out,
+  -t_in)` (`train.swap_faces_target`): both channels are signed distances to their own face along
+  the *same* direction, so exchanging the faces reverses that direction.  A plain swap
+  `(t_out, t_in)` is not a valid two-face target at all (its body `(ch0 > 0) & (ch1 < 0)` is
+  empty).  Consequences:
+  - the body `(sdf_in > 0) & (sdf_out < 0)`, the thickness `sdf_in - sdf_out` and the medial zero
+    set `sdf_in + sdf_out` are **invariant** under the relabelling, so `faces_loss`'s body terms
+    (`gap`, `cldice`), `evaluate`'s `thickness_mae`, `infer.write_surface_channel`'s thickness pass
+    and `dev/eval_region.body_pred_mask` need no change and get none;
+  - only the per-face terms (L1, band Dice, `shell` / `crest` / `far`) see the assignment: they are
+    reported under the chosen one, so the logged keys are unchanged;
+  - the valid BCE is assignment-free.
+  The loss is exactly symmetric: `loss(pred=(a, b), label=(A, B)) == loss(pred=(-b, -a), label=(A,
+  B)) == loss(pred=(a, b), label=(-B, -A))`, term for term (up to which face key each term lands
+  on).  Logged as `aug/faces_swapped_frac` per step and `surface/swapped_frac` in `evaluate`; the
+  flag is recorded in the checkpoint config and stamped on `pred.zarr` as `faces_swap_invariant`.
+  `configs/faces30k_gf_perm.json` is the run, `configs/faces30k_gf_aux.json` its control (same
+  `surface_aux = {gap, cldice}`, no flag).
 - **Umbilicus core mask (`extra.labels.core_radius_vox` / `extra.train.core_radius_vox`, both
   default `0` = off, 2026-09-07).**  Voxels within that **in-plane** radius (level-0 voxels) of the
   umbilicus -- the axis interpolated at each z, `labels.core_mask` -- are dropped from supervision:

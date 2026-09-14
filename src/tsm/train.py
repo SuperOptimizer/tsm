@@ -14,6 +14,10 @@ the coarse store by the dataset.  Losses (all masked by the target valid masks):
            ``extra.train.surface_mode = "faces"`` instead trains a 3-channel head
            [sdf_in, sdf_out, valid] against the two-face labels (``faces_loss``):
            the same L1 + band Dice per face plus the one valid BCE.
+           ``extra.train.faces_swap_invariant`` makes that loss invariant to swapping the two
+           faces (``faces_swap_choice``: the target is relabelled per sample to whichever of
+           (t_in, t_out) / (-t_out, -t_in) is cheaper), so the label carries no global "in /
+           out" naming; logged as ``aug/faces_swapped_frac``.
            ``extra.train.surface_mode = "body"`` trains the *orientation-free* 2-channel head
            [sdf_body, valid] against ``data.body_sdf`` = min(sdf_in, -sdf_out) (``body_loss``):
            the medial terms on the single channel, plus the same optional aux terms with the
@@ -187,6 +191,9 @@ TRAIN_DEFAULTS: dict[str, Any] = {
     "surface_mode": "medial",
     # optional auxiliary surface terms (faces / body modes); null / all-zero weights = unchanged loss
     "surface_aux": None,   # see SURFACE_AUX_DEFAULTS
+    # faces mode only: make the surface loss invariant to swapping the two faces, so the target
+    # carries no global "in / out" naming (see ``faces_swap_choice``).  False = unchanged loss.
+    "faces_swap_invariant": False,
     # train-time umbilicus core mask: voxels within this in-plane radius (fine voxels) of the
     # scroll axis get surface_valid = 2 (ignore) and winding_valid = 0 (see data.CropDataset).
     # 0 = off (unchanged).  The label-build-time equivalent is extra.labels.core_radius_vox.
@@ -326,6 +333,12 @@ def train_opts(cfg: RunCfg) -> dict[str, Any]:
         raise ValueError(f"extra.train.surface_mode must be one of {SURFACE_MODES}, "
                          f"got {opts['surface_mode']!r}")
     opts["surface_aux"] = surface_aux_opts(opts.get("surface_aux"), opts["surface_mode"])
+    if not isinstance(opts["faces_swap_invariant"], bool):
+        raise ValueError("extra.train.faces_swap_invariant must be a bool, got "
+                         f"{opts['faces_swap_invariant']!r}")
+    if opts["faces_swap_invariant"] and opts["surface_mode"] != "faces":
+        raise ValueError("extra.train.faces_swap_invariant needs extra.train.surface_mode='faces', "
+                         f"got {opts['surface_mode']!r}")
     if float(opts["core_radius_vox"]) < 0:
         raise ValueError("extra.train.core_radius_vox must be >= 0")
     opts["core_radius_vox"] = float(opts["core_radius_vox"])
@@ -988,9 +1001,102 @@ def surface_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
     return {"sdf_l1": l1, "valid_bce": bce, "band_dice": dice}
 
 
+# --------------------------------------------------------------------------- #
+# faces mode: permutation (swap) invariance of the two faces
+# --------------------------------------------------------------------------- #
+def swap_faces_target(sdf: torch.Tensor) -> torch.Tensor:
+    """The two-face target with the *identity* of the two faces exchanged: ``(-t_out, -t_in)``.
+
+    Sign convention (``tsm.labels._signed_side``, and the ``inside`` mask of :func:`evaluate`):
+    both channels are the signed distance to their **own** face measured along the SAME global
+    direction -- the one pointing from the in-face to the out-face -- so inside the sheet
+    ``sdf_in > 0 > sdf_out`` and ``thickness = sdf_in - sdf_out``.  Writing ``u`` for that
+    coordinate with the in-face at ``u = 0`` and the out-face at ``u = T``::
+
+        t_in(u) = u,        t_out(u) = u - T
+
+    Renaming the faces means walking the sheet the other way: the new coordinate is ``v = -u``,
+    the new in-face is the old out-face and the new out-face is the old in-face, so
+
+        t_in'(v) = v - (-T) = -(u - T) = -t_out      t_out'(v) = v - 0 = -u = -t_in
+
+    i.e. the swapped pair is ``(-t_out, -t_in)`` -- **negate and swap**, not a plain swap.  The
+    plain swap ``(t_out, t_in)`` is *not* a valid two-face target: it would put the body
+    ``(ch0 > 0) & (ch1 < 0)`` outside the sheet.  With the negation the derived geometry is
+    untouched, which is exactly what makes the naming free:
+
+    * body ``(-t_out > 0) & (-t_in < 0) == (t_in > 0) & (t_out < 0)`` -- the same voxels,
+    * thickness ``(-t_out) - (-t_in) == t_in - t_out`` -- the same value,
+    * medial field ``(-t_out) + (-t_in) == -(t_in + t_out)`` -- the same zero set,
+    * each face's own zero set (and hence ``|sdf|``, the band maps) is unchanged, only exchanged.
+
+    The same map applies to a *prediction*: a model whose two channels are consistently flipped
+    predicts the same sheet, which is why the loss below may choose either assignment.
+    """
+    if sdf.shape[1] != 2:
+        raise ValueError(f"swap_faces_target needs a 2-channel target, got {tuple(sdf.shape)}")
+    return torch.cat([-sdf[:, 1:2], -sdf[:, 0:1]], dim=1)
+
+
+def _per_sample_masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """(B,) mask-weighted mean of ``x`` per sample (the per-sample form of :func:`masked_mean`)."""
+    dims = tuple(range(1, x.ndim))
+    return (x * m).sum(dims) / m.sum(dims).clamp_min(1.0)
+
+
+def _per_sample_band_dice(p: torch.Tensor, t: torch.Tensor, m: torch.Tensor,
+                          tau: float = BAND_TAU) -> torch.Tensor:
+    """(B,) per-sample :func:`surface_band_dice` (the values ``soft_dice`` averages)."""
+    a, b = torch.exp(-p.abs() / tau), torch.exp(-t.abs() / tau)
+    dims = tuple(range(1, a.ndim))
+    inter = (a * b * m).sum(dims)
+    denom = (a * a * m).sum(dims) + (b * b * m).sum(dims)
+    has = (m.sum(dims) > 0).float()
+    return (1.0 - (2.0 * inter + EPS) / (denom + EPS)) * has
+
+
+def faces_swap_choice(pred: torch.Tensor, sdf: torch.Tensor, m1: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample pick between the two face assignments -> ``(chosen target, swapped (B,) bool)``.
+
+    ``extra.train.faces_swap_invariant``.  The two-face target names its faces by a *global*
+    outward convention (in = toward the umbilicus), which the student cannot infer from a crop --
+    a sheet seen from the other side is the same sheet.  For every sample both assignments are
+    scored with the primary per-face terms (gaussian-weighted L1 + band Dice, per sample so the
+    decision is per crop) and the cheaper one wins; the decision is taken under ``no_grad`` (it
+    is an argmin, not a differentiable quantity) and returned as the *target* to use, so every
+    downstream term -- the aux zero-set terms, the body mask, ``gap`` / ``cldice`` -- sees one
+    consistent labelling.  See :func:`swap_faces_target` for why the swapped pair is
+    ``(-t_out, -t_in)`` and why the body / thickness / medial geometry is identical either way
+    (so the body terms are in fact invariant; the per-face terms are not).
+
+    Ties go to the identity assignment.  The resulting loss is exactly symmetric::
+
+        loss(pred=(a, b), label=(A, B)) == loss(pred=(-b, -a), label=(A, B))
+                                        == loss(pred=(a, b), label=(-B, -A))
+
+    -- the same two candidate costs are compared, only their order is exchanged.
+    """
+    with torch.no_grad():
+        def cost(t: torch.Tensor) -> torch.Tensor:
+            c = torch.zeros(pred.shape[0], device=pred.device, dtype=torch.float32)
+            for i in range(2):
+                p_f, t_f = pred[:, i:i + 1].float(), t[:, i:i + 1].float()
+                w = 1.0 + SDF_WMAX * torch.exp(-(t_f ** 2) / (2.0 * SDF_SIGMA ** 2))
+                c = c + _per_sample_masked_mean(w * (p_f - t_f).abs(), m1) + _per_sample_band_dice(p_f, t_f, m1)
+            return c
+
+        t_sw = swap_faces_target(sdf)
+        swapped = cost(t_sw) < cost(sdf)
+    sel = swapped.view(-1, *([1] * (sdf.ndim - 1)))
+    return torch.where(sel, t_sw, sdf), swapped
+
+
 def faces_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
                weight: torch.Tensor | None = None,
-               aux: Mapping[str, Any] | None = None) -> dict[str, torch.Tensor]:
+               aux: Mapping[str, Any] | None = None,
+               swap_invariant: bool = False,
+               stats: dict[str, float] | None = None) -> dict[str, torch.Tensor]:
     """Two-face surface head: pred = [sdf_in, sdf_out, valid logit], target sdf = [sdf_in, sdf_out].
 
     Same terms as :func:`surface_loss` but per face (gaussian-weighted L1 + band Dice on each
@@ -1005,12 +1111,24 @@ def faces_loss(pred: torch.Tensor, sdf: torch.Tensor, valid: torch.Tensor,
     :func:`surface_aux_terms` per face (``shell_in``, ``crest_in``, ``far_in``, ...) and, once for
     both faces together, the body topology terms of :func:`surface_body_terms` (``gap``,
     ``cldice``).  With no ``aux`` -- or all its weights 0 -- nothing is computed and the returned
-    dict is exactly the historical one."""
+    dict is exactly the historical one.
+
+    ``swap_invariant`` (``extra.train.faces_swap_invariant``) drops the global "in / out" naming
+    of the target: for every sample the cheaper of the two face assignments is chosen
+    (:func:`faces_swap_choice`) and the whole loss -- primary terms, aux terms, body terms -- is
+    then evaluated against that relabelled target, so the reported keys are unchanged.  The
+    valid BCE is assignment-free.  ``stats``, when given, receives ``faces_swapped_frac``, the
+    fraction of samples the swapped assignment won.  ``False`` (the default) is bit-identical to
+    the historical loss."""
     if pred.shape[1] < 3 or sdf.shape[1] != 2:
         raise ValueError(f"faces mode needs a 3-channel surface head and a 2-channel target, got {tuple(pred.shape)} / {tuple(sdf.shape)}")
     mv = (valid == 1).float()
     m1 = _weighted(mv, weight)
     m_not2 = _weighted((valid != 2).float(), weight)
+    if swap_invariant:
+        sdf, swapped = faces_swap_choice(pred, sdf, m1)
+        if stats is not None:
+            stats["faces_swapped_frac"] = float(swapped.float().mean())
     do_aux = surface_aux_active(aux)
     out: dict[str, torch.Tensor] = {}
     for i, face in enumerate(("in", "out")):
@@ -1304,6 +1422,7 @@ def compute_losses(
     ds_weights: Sequence[float] = (1.0, 0.5),
     surface_mode: str = "medial",
     surface_aux: Mapping[str, Any] | None = None,
+    faces_swap_invariant: bool = False,
     ink_pos_weight_spec: Any = None,
     head_scale: Mapping[str, float] | None = None,
     head_losses: dict[str, torch.Tensor] | None = None,
@@ -1313,7 +1432,11 @@ def compute_losses(
     ``head_scale`` replaces ``weights[head]`` in the sum with the multiplier of a
     :class:`LossBalancer` (``None`` = plain ``loss_weights``, the historical path).
     ``head_losses``, when given, is filled with the *unweighted* per-head loss tensors
-    (deep-supervision-summed) so the caller can measure per-head gradients."""
+    (deep-supervision-summed) so the caller can measure per-head gradients.
+
+    ``faces_swap_invariant`` (faces mode) makes the surface loss invariant to swapping the two
+    faces; every deep-supervision level makes its own per-sample choice, and the level-0
+    fraction is reported as ``aug/faces_swapped_frac``."""
     weights = {**dict(TRAIN_DEFAULTS["loss_weights"]), **(weights or {})}
     outs = {k: (v if isinstance(v, (list, tuple)) else [v]) for k, v in out.items()}
     n_lvl = len(next(iter(outs.values())))
@@ -1342,8 +1465,12 @@ def compute_losses(
         terms: dict[str, dict[str, torch.Tensor]] = {}
         if "surface" in outs:
             if surface_mode == "faces":
+                fstats: dict[str, float] = {}
                 terms["surface"] = faces_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
-                                              t.get("surface_weight"), aux=surface_aux)
+                                              t.get("surface_weight"), aux=surface_aux,
+                                              swap_invariant=bool(faces_swap_invariant), stats=fstats)
+                if lvl == 0 and "faces_swapped_frac" in fstats:
+                    parts["aug/faces_swapped_frac"] = fstats["faces_swapped_frac"]
             elif surface_mode == "body":
                 terms["surface"] = body_loss(outs["surface"][lvl], t["surface_sdf"], t["surface_valid"],
                                              t.get("surface_weight"), aux=surface_aux)
@@ -2130,6 +2257,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
 
     cl = bool(device == "cuda") if opts["channels_last"] is None else bool(opts["channels_last"])
     smode = str(opts["surface_mode"])
+    swap_inv = bool(opts["faces_swap_invariant"])
     do_fiber = bool(opts["heads"]["fiber"])
     fmode = str(opts["fiber_mode"])
     # extra.train.surface_aux.gap_class > 0 widens the sides surface head by one channel
@@ -2214,6 +2342,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
             out, feats = model(model_input(batch, cl), return_features=True)
         loss, parts = compute_losses(out, batch, opts["loss_weights"], opts["ds_weights"], surface_mode=smode,
                                         surface_aux=opts.get("surface_aux"),
+                                        faces_swap_invariant=swap_inv,
                                         ink_pos_weight_spec=opts["ink_pos_weight"])
         loss.backward()
         if device == "cuda":
@@ -2264,6 +2393,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
     elif os.path.exists(latest) and not force:
         raise FileExistsError(f"{latest} exists; pass --resume to continue or --force to overwrite")
     config_blob = {"train": opts, "widths": list(widths), "surface_mode": smode,
+                   "faces_swap_invariant": swap_inv,
                    "body_stride": int(opts["body_stride"]), "fullres_width": int(opts["fullres_width"]),
                    "norm": str(opts["norm"]),
                    "input_radial": radial, "input_axis": ax_in, "axis_tangent": ax_tan, "fiber_mode": fmode,
@@ -2340,6 +2470,7 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
             hl: dict[str, torch.Tensor] | None = {} if (want_gn and ai == 0) else None
             loss, parts = compute_losses(out, batch, opts["loss_weights"], opts["ds_weights"], surface_mode=smode,
                                         surface_aux=opts.get("surface_aux"),
+                                        faces_swap_invariant=swap_inv,
                                         ink_pos_weight_spec=opts["ink_pos_weight"], head_scale=scales,
                                         head_losses=hl)
             if use_feat:
@@ -2392,7 +2523,10 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
                 # balancer state (ema / measured norms); acc below overrides balance/<head> with
                 # the multipliers that were actually applied this step
                 **{k: round(v, 6) for k, v in bal.log().items()},
-                **{k: (int(v) if k.startswith("aug/") else round(v, 5)) for k, v in acc.items()},
+                # aug/<name> are sample COUNTS (ints); the faces swap fraction is the one
+                # aug/* key that is a fraction
+                **{k: (int(v) if (k.startswith("aug/") and not k.endswith("_frac")) else round(v, 5))
+                   for k, v in acc.items()},
             }
             log_fh.write(json.dumps(rec) + "\n")
             log_fh.flush()
@@ -2418,7 +2552,8 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
         ema.copy_to(model)  # EMA weights (the checkpoint is already saved)
         t = time.perf_counter()
         metrics = evaluate_holdout(_unwrap(model), ds, device=device, batch=B,
-                                   max_crops=int(opts["eval_max_crops"]), surface_mode=smode)
+                                   max_crops=int(opts["eval_max_crops"]), surface_mode=smode,
+                                   faces_swap_invariant=swap_inv)
         metrics["seconds"] = time.perf_counter() - t
         with open(os.path.join(out_dir, "holdout_metrics.json"), "w") as fh:
             json.dump(metrics, fh, indent=2)
@@ -2434,13 +2569,15 @@ def run_train(cfg: RunCfg, dry_run: bool = False, resume: bool = False, force: b
 # evaluation on held-out crops (deterministic, no augmentation)
 # --------------------------------------------------------------------------- #
 def evaluate_holdout(model: torch.nn.Module, ds: Any, device: str = "cpu", batch: int = 1,
-                     max_crops: int | None = None, surface_mode: str = "medial") -> dict[str, Any]:
+                     max_crops: int | None = None, surface_mode: str = "medial",
+                     faces_swap_invariant: bool = False) -> dict[str, Any]:
     """``evaluate`` on ``ds.holdout_origins``, plus per-store metrics for a MultiStoreDataset.
 
     The pooled keys are exactly the single-store ones; every store additionally contributes
     ``<store>/<metric>`` (so ``holdout/<store>/<metric>`` in the summary / holdout_metrics.json)."""
     metrics = evaluate(model, ds, ds.holdout_origins, device=device, batch=batch,
-                       max_crops=max_crops, surface_mode=surface_mode)
+                       max_crops=max_crops, surface_mode=surface_mode,
+                       faces_swap_invariant=faces_swap_invariant)
     names = list(getattr(ds, "names", []) or [])
     if len(names) > 1:
         o = np.asarray(ds.holdout_origins, np.int32).reshape(-1, 4)
@@ -2449,7 +2586,7 @@ def evaluate_holdout(model: torch.nn.Module, ds: Any, device: str = "cpu", batch
             if not len(oi):
                 continue
             m = evaluate(model, ds, oi, device=device, batch=batch, max_crops=max_crops,
-                         surface_mode=surface_mode)
+                         surface_mode=surface_mode, faces_swap_invariant=faces_swap_invariant)
             metrics.update({f"{name}/{kk}": v for kk, v in m.items()})
     return metrics
 
@@ -2583,6 +2720,7 @@ def evaluate(
     max_crops: int | None = None,
     sample_cap: int = 2_000_000,
     surface_mode: str = "medial",
+    faces_swap_invariant: bool = False,
 ) -> dict[str, Any]:
     """Per-head metrics of ``model`` on the fixed, un-augmented crops at ``origins`` of ``ds``.
 
@@ -2618,6 +2756,12 @@ def evaluate(
     (``sigmoid(body logit) > 0.5``) against the 0/1 label body mask, and the fibre direction
     basis uses ``sheet_normal(prefer_fallback=True)`` because the gradient of an unsigned
     distance is degenerate on the ridge.
+    ``faces_swap_invariant`` (faces mode, ``extra.train.faces_swap_invariant``) scores every crop
+    under the better of the two face assignments -- the same per-sample rule the loss uses
+    (:func:`faces_swap_choice`) -- so the ``surface/*`` keys keep their names and a student that
+    labelled a crop the other way round is not punished for it; the fraction of crops the swapped
+    assignment won is reported as ``surface/swapped_frac``.  (``thickness_mae`` and its ``inside``
+    mask are invariant either way, see :func:`swap_faces_target`.)
     Deterministic
     (fixed crop order, no augmentation, eval mode); AUPRC/AUROC use a seeded reservoir of at most
     ``sample_cap`` voxels drawn with equal probability from the whole pooled voxel stream (the
@@ -2647,6 +2791,7 @@ def evaluate(
     # the valid logit is the LAST surface channel: index 2 for the 3-wide heads (faces: after
     # [sdf_in, sdf_out]; sides: after [d_face, body logit]), 1 for the 2-wide ones
     i_valid = 2 if (faces or sides) else 1
+    n_swapped = [0.0, 0.0]        # crops scored under the swapped face assignment / crops seen
     body_sums = [0.0, 0.0, 0.0]   # |pred & label|, |pred|, |label| body voxels (valid == 1)
     body_comp: list[float] = []   # per-crop ratio of 26-connected component counts
     fib_excl = [0.0, 0.0, 0.0]    # n(both), n(either), n(fiber_valid == 1)
@@ -2677,6 +2822,13 @@ def evaluate(
         # surface
         sv = b["surface_valid"]
         m1 = (sv == 1)
+        if faces and faces_swap_invariant:
+            # drop the global in/out naming: score each crop under the assignment the loss would
+            # have chosen (the labels are relabelled, the prediction is untouched)
+            sdf_sel, swapped = faces_swap_choice(out["surface"], b["surface_sdf"], m1.float())
+            b["surface_sdf"] = sdf_sel
+            n_swapped[0] += float(swapped.sum())
+            n_swapped[1] += float(swapped.numel())
         for fi, fname in enumerate(face_names):
             pre = f"surface/{fname}_" if fname else "surface/"
             sdf_t, sdf_p = b["surface_sdf"][:, fi:fi + 1], out["surface"][:, fi:fi + 1]
@@ -2829,6 +2981,8 @@ def evaluate(
         res["surface/body_pred_voxels"] = npred
         res["surface/body_label_voxels"] = nlab
         res["surface/body_n_components_ratio"] = float(np.median(body_comp)) if body_comp else float("nan")
+    if faces and faces_swap_invariant:
+        res["surface/swapped_frac"] = (n_swapped[0] / n_swapped[1]) if n_swapped[1] else float("nan")
     res["surface/valid_auprc"] = average_precision(*samp["valid"].arrays())
     res["ink/ink_auprc"] = average_precision(*samp["ink"].arrays())
     for name in ("vt", "hz"):
