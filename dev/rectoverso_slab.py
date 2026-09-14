@@ -51,6 +51,17 @@ _SLAB_LO: list = []
 _MATRIX = None
 
 
+
+def _transform_base(cfg) -> str:
+    """The volume URL that carries ``transform.json``: the S3 open-data volume when either
+    ``url`` or ``alt_url`` points there (the volcomp mirror does not ship it), else ``alt_url``
+    or ``url`` as before."""
+    cands = [u for u in (cfg.volume.url, cfg.volume.alt_url) if u]
+    for u in cands:
+        if u.startswith("s3://"):
+            return u
+    return cfg.volume.alt_url or cfg.volume.url
+
 def _brick_origins(size, brick):
     return [(z, y, x)
             for z in range(0, size[0], brick[0])
@@ -170,7 +181,7 @@ def main():
     zsize = int(args.zsize) if args.zsize is not None else region_size[0] - z0
 
     tjson = args.transform_url or (
-        (cfg.volume.alt_url or cfg.volume.url).rstrip("/") + "/transform.json")
+        _transform_base(cfg).rstrip("/") + "/transform.json")
     t0 = time.perf_counter()
     doc = xframe.read_transform(tjson)
     matrix = doc.image_to_label_zyx
